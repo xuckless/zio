@@ -2195,24 +2195,7 @@ fn netAcceptImpl(_: ?*anyopaque, server: Io.net.Socket.Handle, _: Io.net.Server.
         var peer_addr: zio_net.Address = undefined;
         var peer_addr_len: os_net.socklen_t = @sizeOf(zio_net.Address);
 
-        var op = ev.NetAccept.init(stdIoHandleToZio(server), &peer_addr.any, &peer_addr_len);
-        try waitForIo(&op.c);
-        const handle = op.getResult() catch |err| switch (err) {
-            error.ConnectionAborted => continue,
-            error.WouldBlock => return error.WouldBlock,
-            error.ProcessFdQuotaExceeded => return error.ProcessFdQuotaExceeded,
-            error.SystemFdQuotaExceeded => return error.SystemFdQuotaExceeded,
-            error.SystemResources => return error.SystemResources,
-            error.SocketNotListening => return error.SocketNotListening,
-            error.ProtocolFailure => return error.ProtocolFailure,
-            error.BlockedByFirewall => return error.BlockedByFirewall,
-            error.NetworkDown => return error.NetworkDown,
-            error.Canceled => return error.Canceled,
-            error.FileDescriptorNotASocket,
-            error.OperationNotSupported,
-            error.Unexpected,
-            => return error.Unexpected,
-        };
+        const handle = if (acceptNow(server, &peer_addr, &peer_addr_len)) |h| h else try acceptWait(server, &peer_addr, &peer_addr_len) orelse continue;
 
         switch (peer_addr.any.family) {
             os_net.AF.INET, os_net.AF.INET6 => os_net.setNoDelay(handle, true) catch {},
@@ -2229,6 +2212,60 @@ fn netAcceptImpl(_: ?*anyopaque, server: Io.net.Socket.Handle, _: Io.net.Server.
             },
         };
     }
+}
+
+/// Accept a connection already waiting in the backlog without going through
+/// the loop, as Go's and Tokio's accept do; null when none is waiting (or on
+/// an error, which the loop path then reports).
+///
+/// Going through the loop parks the task even when the accept completes at
+/// once, and the park puts it behind every other ready task: with thousands
+/// of busy connections on one executor, the acceptor took one connection per
+/// pass over the run queue (~70/s at 4096 connections) while the backlog
+/// waited. Here it takes a connection per quantum of the tick budget and
+/// yields when the slice is spent, like any task that doesn't block.
+///
+/// Listening sockets are nonblocking on every POSIX backend (zio opens them
+/// so; servers set O_NONBLOCK on inherited ones, as the epoll backend's own
+/// optimistic accept already requires), so this never blocks the executor.
+fn acceptNow(server: Io.net.Socket.Handle, peer_addr: *zio_net.Address, peer_addr_len: *os_net.socklen_t) ?ev.Backend.NetHandle {
+    if (builtin.os.tag == .windows) return null;
+    const exec = runtime_mod.getCurrentExecutorOrNull() orelse return null;
+    const task = runtime_mod.getCurrentTaskOrNull() orelse return null;
+    if (task.checkCancel()) |_| {} else |_| return null; // the loop path reports it
+    while (true) {
+        const handle = os_net.accept(stdIoHandleToZio(server), &peer_addr.any, peer_addr_len, .{ .nonblocking = true }) catch |err| switch (err) {
+            error.ConnectionAborted => continue,
+            else => return null,
+        };
+        // A cancel that lands in this yield stays pending for the next
+        // cancelation point; the accepted socket is returned either way.
+        exec.maybeYield(.reschedule, .no_cancel);
+        return handle;
+    }
+}
+
+/// Accept through the loop: wait until a connection arrives. Null means the
+/// connection was aborted before it was accepted; try again.
+fn acceptWait(server: Io.net.Socket.Handle, peer_addr: *zio_net.Address, peer_addr_len: *os_net.socklen_t) Io.net.Server.AcceptError!?ev.Backend.NetHandle {
+    var op = ev.NetAccept.init(stdIoHandleToZio(server), &peer_addr.any, peer_addr_len);
+    try waitForIo(&op.c);
+    return op.getResult() catch |err| switch (err) {
+        error.ConnectionAborted => null,
+        error.WouldBlock => return error.WouldBlock,
+        error.ProcessFdQuotaExceeded => return error.ProcessFdQuotaExceeded,
+        error.SystemFdQuotaExceeded => return error.SystemFdQuotaExceeded,
+        error.SystemResources => return error.SystemResources,
+        error.SocketNotListening => return error.SocketNotListening,
+        error.ProtocolFailure => return error.ProtocolFailure,
+        error.BlockedByFirewall => return error.BlockedByFirewall,
+        error.NetworkDown => return error.NetworkDown,
+        error.Canceled => return error.Canceled,
+        error.FileDescriptorNotASocket,
+        error.OperationNotSupported,
+        error.Unexpected,
+        => return error.Unexpected,
+    };
 }
 
 fn openErrToBindErr(err: OpenOrCancel) Io.net.IpAddress.BindError {
