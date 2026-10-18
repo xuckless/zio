@@ -2214,6 +2214,11 @@ fn netAcceptImpl(_: ?*anyopaque, server: Io.net.Socket.Handle, _: Io.net.Server.
     }
 }
 
+/// Direct accepts in a row on this executor thread; see `acceptNow`.
+threadlocal var accept_burst: u8 = 0;
+/// Tokio's per-task coop budget.
+const max_accept_burst = 128;
+
 /// Accept a connection already waiting in the backlog without going through
 /// the loop, as Go's and Tokio's accept do; null when none is waiting (or on
 /// an error, which the loop path then reports).
@@ -2222,25 +2227,32 @@ fn netAcceptImpl(_: ?*anyopaque, server: Io.net.Socket.Handle, _: Io.net.Server.
 /// once, and the park puts it behind every other ready task: with thousands
 /// of busy connections on one executor, the acceptor took one connection per
 /// pass over the run queue (~70/s at 4096 connections) while the backlog
-/// waited. Here it takes a connection per quantum of the tick budget and
-/// yields when the slice is spent, like any task that doesn't block.
+/// waited. The tick budget is no bound here either, since the busy
+/// connections have spent most of it by the time the acceptor runs. So, like
+/// Tokio, the acceptor gets a budget of its own: up to `max_accept_burst`
+/// connections in a row, then one trip through the loop, which yields.
 ///
 /// Listening sockets are nonblocking on every POSIX backend (zio opens them
 /// so; servers set O_NONBLOCK on inherited ones, as the epoll backend's own
 /// optimistic accept already requires), so this never blocks the executor.
 fn acceptNow(server: Io.net.Socket.Handle, peer_addr: *zio_net.Address, peer_addr_len: *os_net.socklen_t) ?ev.Backend.NetHandle {
     if (builtin.os.tag == .windows) return null;
-    const exec = runtime_mod.getCurrentExecutorOrNull() orelse return null;
+    if (accept_burst >= max_accept_burst) {
+        accept_burst = 0;
+        return null;
+    }
+    _ = runtime_mod.getCurrentExecutorOrNull() orelse return null;
     const task = runtime_mod.getCurrentTaskOrNull() orelse return null;
     if (task.checkCancel()) |_| {} else |_| return null; // the loop path reports it
     while (true) {
         const handle = os_net.accept(stdIoHandleToZio(server), &peer_addr.any, peer_addr_len, .{ .nonblocking = true }) catch |err| switch (err) {
             error.ConnectionAborted => continue,
-            else => return null,
+            else => {
+                accept_burst = 0;
+                return null;
+            },
         };
-        // A cancel that lands in this yield stays pending for the next
-        // cancelation point; the accepted socket is returned either way.
-        exec.maybeYield(.reschedule, .no_cancel);
+        accept_burst += 1;
         return handle;
     }
 }
