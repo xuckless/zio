@@ -8,6 +8,9 @@ const assert = std.debug.assert;
 const zio_options = @import("options.zig").options;
 const multi_executor = zio_options.scheduling.multiExecutor();
 const migrates = zio_options.scheduling.migrates();
+/// See `RuntimeOptions.idle_stack_trim`: a task's executor trims its stack,
+/// which needs the task to stay there.
+const idle_trim_supported = !migrates and @import("coro/stack.zig").can_trim;
 
 const ev = @import("ev/root.zig");
 const os = @import("os/root.zig");
@@ -138,6 +141,17 @@ pub const RuntimeOptions = struct {
         .maximum_size = 8 * 1024 * 1024,
         .committed_size = 256 * 1024,
     },
+    /// A task suspended this long (give or take as much again: the
+    /// executor checks at this interval) gives the OS back the stack pages
+    /// below where it waits. A task keeps every stack page it ever touched,
+    /// so one that went deep once (a request through its handler, a TLS
+    /// handshake) and then waits at a shallow depth (an idle keep-alive
+    /// connection, a WebSocket) would hold the deep path's pages for the
+    /// whole wait. One madvise per task per wait that lasts; a task woken
+    /// sooner costs nothing. `.zero` turns it off. Only where tasks stay on
+    /// their executor (single-executor and pinned scheduling), and only on
+    /// Linux (x86_64, aarch64).
+    idle_stack_trim: Duration = .fromSeconds(1),
     /// When non-zero, a monitor thread logs the scheduler counters'
     /// per-interval deltas at this cadence. A dedicated thread rather than
     /// an executor timer, so it keeps reporting even when every executor is
@@ -538,6 +552,10 @@ pub const Executor = struct {
     // Periodic timer driving the stack pool's watermark shrink pass. The
     // pool rate-limits itself, so every executor may carry this timer.
     stack_pool_shrink_timer: ev.Timer = ev.Timer.init(.{ .duration = .fromSeconds(60) }),
+    /// Tasks waiting since `AnyTask.idle.since`, oldest first, until their
+    /// stacks are trimmed or they run again (`RuntimeOptions.idle_stack_trim`).
+    idle_tasks: std.DoublyLinkedList = .{},
+    idle_trim_timer: ev.Timer = ev.Timer.init(.{ .duration = .fromSeconds(1) }),
 
     // The task currently executing on this executor, or null when we are running
     // scheduler code (the run loop, a context switch, a completion callback) rather
@@ -632,9 +650,57 @@ pub const Executor = struct {
             self.loop.add(&self.stack_pool_shrink_timer.c);
         }
 
+        if (comptime idle_trim_supported) {
+            const after = self.runtime.options.idle_stack_trim;
+            if (after.value > 0) {
+                self.idle_trim_timer = ev.Timer.init(.{ .duration = after });
+                self.idle_trim_timer.c.callback = idleTrimCallback;
+                self.idle_trim_timer.c.flags.rearm = true;
+                self.loop.add(&self.idle_trim_timer.c);
+            }
+        }
+
         self.main_task.coro.setCurrent();
         setCurrentExecutor(self);
         self.current_task = &self.main_task;
+    }
+
+    /// Trims the stacks of the tasks waiting since an interval ago or
+    /// longer, once per wait. The list is in the order they parked, so the
+    /// walk stops at the first one still young.
+    fn idleTrimCallback(loop: *ev.Loop, c: *ev.Completion) void {
+        const timer = c.cast(ev.Timer);
+        const self: *Executor = @alignCast(@fieldParentPtr("idle_trim_timer", timer));
+        const cutoff = loop.now();
+        const after = self.runtime.options.idle_stack_trim;
+        while (self.idle_tasks.first) |node| {
+            const task: *AnyTask = @fieldParentPtr("idle_node", node);
+            if (task.idle_since.addDuration(after).value > cutoff.value) break;
+            self.unlistIdle(task);
+            const ctx = &task.coro.context;
+            const sp: usize = switch (builtin.cpu.arch) {
+                .x86_64 => ctx.rsp,
+                .aarch64 => ctx.sp,
+                else => unreachable,
+            };
+            @import("coro/stack.zig").stackTrim(ctx.stack_info, sp);
+        }
+    }
+
+    /// A spawned task just parked: listed for `idleTrimCallback`.
+    fn listIdle(self: *Executor, task: *AnyTask) void {
+        if (comptime !idle_trim_supported) return;
+        if (task == &self.main_task or self.runtime.options.idle_stack_trim.value == 0) return;
+        task.idle_since = self.loop.now();
+        task.idle_listed = true;
+        self.idle_tasks.append(&task.idle_node);
+    }
+
+    fn unlistIdle(self: *Executor, task: *AnyTask) void {
+        if (comptime !idle_trim_supported) return;
+        if (!task.idle_listed) return;
+        self.idle_tasks.remove(&task.idle_node);
+        task.idle_listed = false;
     }
 
     pub fn deinit(self: *Executor) void {
@@ -1163,7 +1229,9 @@ pub const Executor = struct {
             break :blk self.run_queue.pop() orelse return null;
         };
         self.spendQuantum();
-        return AnyTask.fromWaitNode(node);
+        const task = AnyTask.fromWaitNode(node);
+        self.unlistIdle(task);
+        return task;
     }
 
     /// Schedule a task on this executor's local run queue. MUST run on the owning
@@ -1341,9 +1409,13 @@ pub const Executor = struct {
                         self.scheduleTaskLocal(task);
                         return;
                     }
-                    // Normal: transition to .waiting
+                    // Normal: transition to .waiting. Listed first: once
+                    // .waiting, a waker may queue it, though only this
+                    // thread runs it (and unlists it) after.
+                    self.listIdle(task);
                     const desired = AnyTask.State{ .tag = .waiting, .awaken = false };
                     if (task.state.cmpxchgWeak(old, desired, .acq_rel, .acquire)) |actual| {
+                        self.unlistIdle(task);
                         old = actual;
                         continue;
                     }
@@ -2188,6 +2260,15 @@ pub const Runtime = struct {
     /// Recover the `*Runtime` from a `std.Io` produced by `Runtime.io()`
     /// or `Runtime.blockingIo()`, or null when it is backed by some other
     /// implementation.
+    /// The index of the calling thread's executor in this runtime (what
+    /// `Placement.executor` takes), or null when the thread is not one of
+    /// its executors.
+    pub fn currentExecutor(self: *Runtime) ?ExecutorId {
+        const exec = getCurrentExecutorOrNull() orelse return null;
+        if (exec.runtime != self) return null;
+        return exec.id;
+    }
+
     pub fn fromIo(value: std.Io) ?*Runtime {
         const io_impl = @import("io.zig");
         if (value.vtable != &io_impl.vtable or value.userdata == null) return null;
@@ -3130,4 +3211,73 @@ test "debug_cancel: reports a task that parks after swallowing error.Canceled" {
     propagating.cancel();
     try swallowing.join();
     try propagating.join();
+}
+
+test "Runtime: currentExecutor names the calling executor" {
+    const runtime = try Runtime.init(std.testing.allocator, .{});
+    defer runtime.deinit();
+    try std.testing.expectEqual(@as(?ExecutorId, 0), runtime.currentExecutor());
+
+    const other = try Runtime.init(std.testing.allocator, .{ .enable_main_executor = false });
+    defer other.deinit();
+    // This thread is the first runtime's executor, not the second's.
+    try std.testing.expectEqual(@as(?ExecutorId, null), other.currentExecutor());
+
+    const worker = struct {
+        fn run(rt: *Runtime) !void {
+            try std.testing.expectEqual(@as(?ExecutorId, 0), rt.currentExecutor());
+        }
+    };
+    var handle = try runtime.spawn(worker.run, .{runtime});
+    try handle.join();
+}
+
+test "Runtime: a task waiting past idle_stack_trim gives back its deeper stack pages" {
+    if (comptime !idle_trim_supported) return error.SkipZigTest;
+    const stack = @import("coro/stack.zig");
+    const runtime = try Runtime.init(std.testing.allocator, .{ .idle_stack_trim = .fromMilliseconds(20) });
+    defer runtime.deinit();
+
+    const worker = struct {
+        /// Touches about 64 KiB of stack below the caller.
+        noinline fn deep(depth: usize) u8 {
+            var buf: [4096]u8 = undefined;
+            @memset(&buf, @truncate(depth));
+            std.mem.doNotOptimizeAway(&buf);
+            if (depth == 0) return buf[0];
+            return deep(depth - 1) +% buf[depth];
+        }
+
+        /// Pages of the stack from its limit up to the page below `frame`
+        /// that are resident.
+        fn resident(info: stack.StackInfo, frame: usize) !usize {
+            const ps = std.heap.pageSize();
+            const end = std.mem.alignBackward(usize, frame, ps) - ps;
+            var vec: [512]u8 = undefined;
+            const pages = (end - info.limit) / ps;
+            std.debug.assert(pages <= vec.len);
+            const rc = std.os.linux.mincore(@ptrFromInt(info.limit), end - info.limit, &vec);
+            if (std.os.linux.errno(rc) != .SUCCESS) return error.Mincore;
+            var n: usize = 0;
+            for (vec[0..pages]) |v| n += v & 1;
+            return n;
+        }
+
+        fn run(rt: *Runtime) !void {
+            const info = getCurrentTask().coro.context.stack_info;
+            _ = deep(16);
+            const frame = @frameAddress();
+            try std.testing.expect(try resident(info, frame) >= 16);
+            // A short wait keeps them.
+            try rt.sleep(.fromMicroseconds(100));
+            try std.testing.expect(try resident(info, frame) >= 16);
+            // A long one does not, deeper than the sleep's own frames.
+            try rt.sleep(.fromMilliseconds(100));
+            try std.testing.expect(try resident(info, frame) <= 2);
+            // The stack still works below, on zeroed pages.
+            _ = deep(16);
+        }
+    };
+    var handle = try runtime.spawn(worker.run, .{runtime});
+    try handle.join();
 }

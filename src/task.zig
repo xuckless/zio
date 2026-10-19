@@ -198,6 +198,13 @@ pub const AnyTask = struct {
 
     runtime: *Runtime,
 
+    /// On its executor's list of waiting tasks whose stacks are not trimmed
+    /// yet (`RuntimeOptions.idle_stack_trim`); only that executor touches
+    /// these.
+    idle_node: std.DoublyLinkedList.Node = .{},
+    idle_since: Timestamp = .zero,
+    idle_listed: bool = false,
+
     /// Head of this task's intrusive task-local binding chain (see `TaskLocal`).
     /// Only ever accessed by the task itself, so it needs no synchronization.
     tls_head: ?*TaskLocalNode = null,
