@@ -650,12 +650,13 @@ fn submitInner(self: *Self, state: *LoopState, comptime op: Op, c: *Completion, 
                 .namelen = data.slots[0].addr_len,
                 .iov = (&data.internal.iov)[0..1].ptr,
                 .iovlen = 1,
-                .control = null,
-                .controllen = 0,
+                .control = if (data.slots[0].control.len != 0) data.slots[0].control.ptr else null,
+                .controllen = data.slots[0].control.len,
                 .flags = 0,
             };
             const sqe = self.getSqeOrDefer(c) orelse return;
-            sqe.prep_recvmsg(data.handle, &data.internal.msg, recvFlagsToMsg(data.flags));
+            const cloexec_flag: u32 = if (data.slots[0].control.len != 0) linux.MSG.CMSG_CLOEXEC else 0;
+            sqe.prep_recvmsg(data.handle, &data.internal.msg, recvFlagsToMsg(data.flags) | cloexec_flag);
             sqe.user_data = @intFromPtr(c);
         },
         .net_sendmsg => {
@@ -1845,6 +1846,7 @@ fn storeRecvMmsgResult(c: *Completion, res: i32, _: u32) void {
     data.slots[0].received_len = @intCast(res);
     data.slots[0].addr_len = data.internal.msg.namelen;
     data.slots[0].msg_flags = data.internal.msg.flags;
+    data.slots[0].control_len = data.internal.msg.controllen;
 
     var count: u32 = 1;
 

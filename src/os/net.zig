@@ -1545,14 +1545,24 @@ pub fn recvmmsg(
     msgvec: [*]mmsghdr,
     vlen: u32,
     flags: RecvFlags,
+    /// Some message has room for control messages: received descriptors
+    /// are made close-on-exec, as `recvmsg` does.
+    with_control: bool,
 ) RecvError!u32 {
-    const sys_flags = recvFlagsToSys(flags);
+    const has_cmsg_cloexec = @hasDecl(posix.system.MSG, "CMSG_CLOEXEC");
+    const cloexec_flag: c_int = if (has_cmsg_cloexec and with_control) posix.system.MSG.CMSG_CLOEXEC else 0;
+    const sys_flags = recvFlagsToSys(flags) | cloexec_flag;
 
     while (true) {
         const rc = recvmmsg_syscall(fd, msgvec, vlen, @intCast(sys_flags));
 
         switch (posix.errno(rc)) {
-            .SUCCESS => return @intCast(rc),
+            .SUCCESS => {
+                if (!has_cmsg_cloexec and with_control) for (msgvec[0..@intCast(rc)]) |m| {
+                    if (m.hdr.controllen > 0) setReceivedFdsCloexec(@as([*]const u8, @ptrCast(m.hdr.control.?))[0..m.hdr.controllen]);
+                };
+                return @intCast(rc);
+            },
             .INTR => continue,
             else => |err| return errnoToRecvError(err),
         }
@@ -1576,6 +1586,26 @@ const recvmmsg_libc = if (builtin.os.tag == .freebsd or builtin.os.tag == .netbs
     }.recvmmsg
 else
     void;
+
+/// `sendmmsg`: several datagrams in one system call (Linux).
+pub const has_sendmmsg = builtin.os.tag == .linux;
+
+/// Sends the messages in `msgvec` with one `sendmmsg` that never waits:
+/// returns how many the kernel took, which is fewer than `vlen` when the
+/// next would block or fail (the following call reports that one), and
+/// `error.WouldBlock` when it took none. Each message's `len` is set to the
+/// bytes sent.
+pub fn sendmmsg(fd: fd_t, msgvec: [*]mmsghdr, vlen: u32, flags: SendFlags) SendError!u32 {
+    const sys_flags = sendFlagsToSys(flags) | posix.system.MSG.DONTWAIT;
+    while (true) {
+        const rc = posix.system.sendmmsg(fd, msgvec, vlen, @intCast(sys_flags));
+        switch (posix.errno(rc)) {
+            .SUCCESS => return @intCast(rc),
+            .INTR => continue,
+            else => |err| return errnoToSendError(err),
+        }
+    }
+}
 
 pub fn sendmsg(
     fd: fd_t,

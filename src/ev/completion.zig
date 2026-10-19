@@ -1147,7 +1147,16 @@ pub const NetRecvMmsg = struct {
         addr: net.sockaddr.storage = undefined,
         addr_len: net.socklen_t = @sizeOf(net.sockaddr.storage),
         msg_flags: u32 = 0,
+        /// Room for the datagram's control messages; empty for none.
+        control: []u8 = &.{},
+        /// How much of `control` the kernel filled.
+        control_len: usize = 0,
     };
+
+    fn hasControl(slots: []const Slot) bool {
+        for (slots) |s| if (s.control.len != 0) return true;
+        return false;
+    }
 
     pub fn init(
         handle: Backend.NetHandle,
@@ -1175,6 +1184,7 @@ pub const NetRecvMmsg = struct {
             .trunc = self.flags.trunc,
             .dontwait = true,
         };
+        const with_control = hasControl(self.slots);
         if (net.has_recvmmsg) {
             const batch_len: u32 = @intCast(@min(self.slots.len, max_batch));
             var msgvec: [max_batch]net.mmsghdr = undefined;
@@ -1187,14 +1197,14 @@ pub const NetRecvMmsg = struct {
                         .namelen = self.slots[i].addr_len,
                         .iov = (&iovecs[i])[0..1].ptr,
                         .iovlen = 1,
-                        .control = null,
-                        .controllen = 0,
+                        .control = if (self.slots[i].control.len != 0) self.slots[i].control.ptr else null,
+                        .controllen = self.slots[i].control.len,
                         .flags = 0,
                     },
                     .len = 0,
                 };
             }
-            const n = net.recvmmsg(self.handle, &msgvec, batch_len, flags) catch |err| switch (err) {
+            const n = net.recvmmsg(self.handle, &msgvec, batch_len, flags, with_control) catch |err| switch (err) {
                 error.Unexpected => return recvSingleFromSlot(self.handle, &self.slots[0], flags),
                 else => |e| return e,
             };
@@ -1202,6 +1212,7 @@ pub const NetRecvMmsg = struct {
                 self.slots[i].received_len = msgvec[i].len;
                 self.slots[i].addr_len = msgvec[i].hdr.namelen;
                 self.slots[i].msg_flags = msgvec[i].hdr.flags;
+                self.slots[i].control_len = msgvec[i].hdr.controllen;
             }
             self.drained = true;
             return n;
@@ -1211,9 +1222,10 @@ pub const NetRecvMmsg = struct {
 
     fn recvSingleFromSlot(handle: Backend.NetHandle, slot: *Slot, flags: net.RecvFlags) net.RecvError!u32 {
         var iov = net.iovecFromSlice(slot.data);
-        const result = try net.recvmsg(handle, (&iov)[0..1], flags, @ptrCast(&slot.addr), &slot.addr_len, null);
+        const result = try net.recvmsg(handle, (&iov)[0..1], flags, @ptrCast(&slot.addr), &slot.addr_len, if (slot.control.len != 0) slot.control else null);
         slot.received_len = @intCast(result.len);
         slot.msg_flags = result.flags;
+        slot.control_len = result.controllen;
         return 1;
     }
 };
