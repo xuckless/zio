@@ -33,6 +33,9 @@ pub const beginShield = runtime.beginShield;
 pub const endShield = runtime.endShield;
 pub const checkCancel = runtime.checkCancel;
 pub const recancel = runtime.recancel;
+/// The task the caller runs on, or null off a task. Another task may
+/// `cancel` it, as an armed `AutoCancel` would, for as long as it runs.
+pub const currentTask = runtime.getCurrentTaskOrNull;
 
 pub const AutoCancel = @import("autocancel.zig").AutoCancel;
 pub const withTimeout = @import("autocancel.zig").withTimeout;
