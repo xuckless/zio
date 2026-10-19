@@ -466,7 +466,7 @@ fn operateInner(operation: Io.Operation, timeout: time.Timeout, clock: time.Cloc
         .device_io_control => |*o| return .{ .device_io_control = try @call(.never_inline, deviceIoControlOp, .{ o, timeout, clock }) },
         .net_receive => |*o| return .{
             .net_receive = result: {
-                if (o.message_buffer.len > 1 and !o.flags.peek and !o.flags.trunc and !hasControl(o.message_buffer) and os_net.has_recvmmsg) {
+                if (o.message_buffer.len > 1 and !o.flags.peek and !o.flags.trunc and os_net.has_recvmmsg) {
                     break :result @call(.never_inline, netReceiveMmsg, .{ o, timeout, clock }) catch |err| switch (err) {
                         error.Canceled => |e| return e,
                         error.Timeout => |e| return e,
@@ -2582,7 +2582,17 @@ fn netSendOpImpl(
 ) (Io.Cancelable || common.Timeoutable)!Io.Operation.NetSend.Result {
     const zio_flags = zioSendFlags(flags);
 
-    for (messages, 0..) |*msg, i| {
+    // Several datagrams: as many as the kernel takes at once in one
+    // `sendmmsg`, the rest (if a socket buffer filled) one by one below,
+    // waiting for room.
+    var start: usize = 0;
+    if (os_net.has_sendmmsg and messages.len > 1) {
+        const r = @call(.never_inline, netSendMmsg, .{ handle, messages, zio_flags });
+        if (r.err) |err| return .{ sendErrToSocketSendErr(err), r.sent };
+        start = r.sent;
+    }
+
+    for (messages[start..], start..) |*msg, i| {
         const zio_addr = stdIoIpToZio(msg.address.*);
         const iovec = os_net.iovecConstFromSlice(msg.data_ptr[0..msg.data_len]);
 
@@ -2599,6 +2609,47 @@ fn netSendOpImpl(
         msg.data_len = sent;
     }
     return .{ null, messages.len };
+}
+
+const max_send_mmsg = 32;
+
+/// Sends from the front of `messages` with non-blocking `sendmmsg` calls
+/// until all have gone or the socket would block; returns how many went.
+fn netSendMmsg(
+    handle: Io.net.Socket.Handle,
+    messages: []Io.net.OutgoingMessage,
+    flags: os_net.SendFlags,
+) struct { sent: usize, err: ?os_net.SendError } {
+    var sent: usize = 0;
+    var addrs: [max_send_mmsg]zio_net.IpAddress = undefined;
+    var iovecs: [max_send_mmsg]os_net.iovec_const = undefined;
+    var msgvec: [max_send_mmsg]os_net.mmsghdr = undefined;
+    while (sent < messages.len) {
+        const batch = messages[sent..][0..@min(messages.len - sent, max_send_mmsg)];
+        for (batch, 0..) |*msg, i| {
+            addrs[i] = stdIoIpToZio(msg.address.*);
+            iovecs[i] = os_net.iovecConstFromSlice(msg.data_ptr[0..msg.data_len]);
+            msgvec[i] = .{
+                .hdr = .{
+                    .name = @ptrCast(&addrs[i].any),
+                    .namelen = sockAddrLen(&addrs[i].any),
+                    .iov = @ptrCast(&iovecs[i]),
+                    .iovlen = 1,
+                    .control = if (msg.control.len != 0) @constCast(msg.control.ptr) else null,
+                    .controllen = msg.control.len,
+                    .flags = 0,
+                },
+                .len = 0,
+            };
+        }
+        const n = os_net.sendmmsg(stdIoHandleToZio(handle), &msgvec, @intCast(batch.len), flags) catch |err| switch (err) {
+            error.WouldBlock => return .{ .sent = sent, .err = null },
+            else => |e| return .{ .sent = sent, .err = e },
+        };
+        for (batch[0..n], msgvec[0..n]) |*msg, m| msg.data_len = m.len;
+        sent += n;
+    }
+    return .{ .sent = sent, .err = null };
 }
 
 fn netReadOpImpl(
@@ -2682,13 +2733,6 @@ fn decodeIncomingFlags(raw: u32) Io.net.IncomingMessage.Flags {
     }
 }
 
-fn hasControl(messages: []const Io.net.IncomingMessage) bool {
-    for (messages) |m| {
-        if (m.control.len != 0) return true;
-    }
-    return false;
-}
-
 const max_mmsg_slots = 64;
 
 fn netReceiveMmsg(
@@ -2708,7 +2752,7 @@ fn netReceiveMmsg(
     for (0..n) |i| {
         const start = i * chunk;
         const end = if (i + 1 == n) o.data_buffer.len else start + chunk;
-        slots[i] = .{ .data = o.data_buffer[start..end] };
+        slots[i] = .{ .data = o.data_buffer[start..end], .control = o.message_buffer[i].control };
     }
 
     const zio_flags: os_net.RecvFlags = .{
@@ -2731,7 +2775,7 @@ fn netReceiveMmsg(
         o.message_buffer[i] = .{
             .from = senderAddrToStdIo(@ptrCast(&slots[i].addr), slots[i].addr_len),
             .data = slots[i].data[0..slots[i].received_len],
-            .control = &.{},
+            .control = slots[i].control[0..slots[i].control_len],
             .flags = decodeIncomingFlags(slots[i].msg_flags),
         };
     }
@@ -5128,6 +5172,56 @@ test "io: receiveManyTimeout returns every datagram already queued" {
     const err2, const n2 = receiver.receiveManyTimeout(io, &messages, &buf, .{}, .{ .duration = .{ .raw = .fromMilliseconds(10), .clock = .awake } });
     try std.testing.expect(err2.? == error.Timeout);
     try std.testing.expectEqual(0, n2);
+}
+
+test "io: sendManyTimeout and receiveManyTimeout carry several datagrams with control messages" {
+    const rt = try Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+    const io = rt.io();
+
+    var sender = try Io.net.IpAddress.bind(&.{ .ip4 = .loopback(0) }, io, .{ .mode = .dgram });
+    defer sender.close(io);
+    var receiver = try Io.net.IpAddress.bind(&.{ .ip4 = .loopback(0) }, io, .{ .mode = .dgram });
+    defer receiver.close(io);
+    // The TOS byte of each datagram comes with it, as a control message.
+    const one: c_int = 1;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.setsockopt(receiver.handle, std.posix.IPPROTO.IP, std.posix.IP.RECVTOS, @ptrCast(&one), @sizeOf(c_int)));
+
+    const payloads = [_][]const u8{ "one", "two", "three", "four", "five" };
+    var out: [payloads.len]Io.net.OutgoingMessage = undefined;
+    for (&out, payloads) |*m, p| m.* = .{ .address = &receiver.address, .data_ptr = p.ptr, .data_len = p.len };
+    const send_err, const sent = sender.sendManyTimeout(io, &out, .{}, .none);
+    try std.testing.expectEqual(null, send_err);
+    try std.testing.expectEqual(payloads.len, sent);
+    for (out, payloads) |m, p| try std.testing.expectEqual(p.len, m.data_len);
+
+    var messages: [8]Io.net.IncomingMessage = @splat(.init);
+    var controls: [8][64]u8 align(Io.net.cmsg_align) = undefined;
+    var buf: [8 * 64]u8 = undefined;
+    const timeout: Io.Timeout = .{ .duration = .{ .raw = .fromSeconds(1), .clock = .awake } };
+    var seen: usize = 0;
+    while (seen < payloads.len) {
+        for (&messages, &controls) |*m, *ctl| {
+            m.* = .init;
+            m.control = ctl;
+        }
+        const err, const n = receiver.receiveManyTimeout(io, &messages, &buf, .{}, timeout);
+        try std.testing.expectEqual(null, err);
+        try std.testing.expect(n > 0);
+        // Linux loopback delivery finishes inside send: one call has them all.
+        if (builtin.os.tag == .linux) try std.testing.expectEqual(payloads.len, n);
+        for (messages[0..n]) |*message| {
+            try std.testing.expectEqualStrings(payloads[seen], message.data);
+            try std.testing.expectEqual(sender.address.getPort(), message.from.getPort());
+            var tos = false;
+            var it: Io.net.cmsg.Iterator = .{ .control = @alignCast(message.control) };
+            while (it.next()) |cm| {
+                if (cm.header.level == std.posix.IPPROTO.IP and (cm.header.type == std.posix.IP.TOS or cm.header.type == std.posix.IP.RECVTOS)) tos = true;
+            }
+            try std.testing.expect(tos);
+            seen += 1;
+        }
+    }
 }
 
 test "io: receiveManyTimeout stops when the data buffer is full" {
