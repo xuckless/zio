@@ -441,10 +441,14 @@ fn operateImpl(_: ?*anyopaque, operation: Io.Operation) Io.Cancelable!Io.Operati
     };
 }
 
+/// Every arm calls out rather than inlining: each operation's completion
+/// and vectors would otherwise share one frame the size of all of them,
+/// under every wait a task makes for I/O (and so on the stack of every
+/// idle connection).
 fn operateInner(operation: Io.Operation, timeout: time.Timeout, clock: time.Clock) (Io.Cancelable || common.Timeoutable)!Io.Operation.Result {
     switch (operation) {
         .file_read_streaming => |*o| return .{ .file_read_streaming = result: {
-            const n = fileReadStreamingImpl(o.file, o.data, timeout, clock) catch |err| switch (err) {
+            const n = @call(.never_inline, fileReadStreamingImpl, .{ o.file, o.data, timeout, clock }) catch |err| switch (err) {
                 error.Canceled => |e| return e,
                 error.Timeout => |e| return e,
                 else => |e| break :result e,
@@ -452,41 +456,34 @@ fn operateInner(operation: Io.Operation, timeout: time.Timeout, clock: time.Cloc
             break :result n;
         } },
         .file_write_streaming => |*o| return .{ .file_write_streaming = result: {
-            const n = fileWriteStreamingImpl(o.file, o.header, o.data, o.splat, timeout, clock) catch |err| switch (err) {
+            const n = @call(.never_inline, fileWriteStreamingImpl, .{ o.file, o.header, o.data, o.splat, timeout, clock }) catch |err| switch (err) {
                 error.Canceled => |e| return e,
                 error.Timeout => |e| return e,
                 else => |e| break :result e,
             };
             break :result n;
         } },
-        .device_io_control => |*o| return .{ .device_io_control = result: {
-            var op = if (builtin.os.tag == .windows)
-                ev.DeviceIoControl.init(stdIoHandleToZio(o.file.handle), o.code, o.in, o.out)
-            else
-                ev.DeviceIoControl.init(stdIoHandleToZio(o.file.handle), o.code, o.arg);
-            try timedWaitForIoClock(&op.c, timeout, clock);
-            break :result try op.getResult();
-        } },
+        .device_io_control => |*o| return .{ .device_io_control = try @call(.never_inline, deviceIoControlOp, .{ o, timeout, clock }) },
         .net_receive => |*o| return .{
             .net_receive = result: {
                 if (o.message_buffer.len > 1 and !o.flags.peek and !o.flags.trunc and !hasControl(o.message_buffer) and os_net.has_recvmmsg) {
-                    break :result netReceiveMmsg(o, timeout, clock) catch |err| switch (err) {
+                    break :result @call(.never_inline, netReceiveMmsg, .{ o, timeout, clock }) catch |err| switch (err) {
                         error.Canceled => |e| return e,
                         error.Timeout => |e| return e,
                     };
                 }
-                netReceiveImpl(o.socket_handle, &o.message_buffer[0], o.data_buffer, o.flags, false, timeout, clock) catch |err| switch (err) {
+                @call(.never_inline, netReceiveImpl, .{ o.socket_handle, &o.message_buffer[0], o.data_buffer, o.flags, false, timeout, clock }) catch |err| switch (err) {
                     error.Canceled => |e| return e,
                     error.Timeout => |e| return e,
                     error.WouldBlock => unreachable,
                     else => |e| break :result .{ e, 0 },
                 };
-                break :result netReceiveMore(o);
+                break :result @call(.never_inline, netReceiveMore, .{o});
             },
         },
-        .net_send => |*o| return .{ .net_send = try netSendOpImpl(o.socket_handle, o.messages, o.flags, timeout, clock) },
+        .net_send => |*o| return .{ .net_send = try @call(.never_inline, netSendOpImpl, .{ o.socket_handle, o.messages, o.flags, timeout, clock }) },
         .net_read => |*o| return .{ .net_read = result: {
-            const n = netReadOpImpl(o.socket_handle, o.data, timeout, clock) catch |err| switch (err) {
+            const n = @call(.never_inline, netReadOpImpl, .{ o.socket_handle, o.data, timeout, clock }) catch |err| switch (err) {
                 error.Canceled => |e| return e,
                 error.Timeout => |e| return e,
                 else => |e| break :result e,
@@ -494,7 +491,7 @@ fn operateInner(operation: Io.Operation, timeout: time.Timeout, clock: time.Cloc
             break :result .{ .data_len = n };
         } },
         .net_write => |*o| return .{ .net_write = result: {
-            const n = netWriteOpImpl(o.socket_handle, o.header, o.data, o.splat, timeout, clock) catch |err| switch (err) {
+            const n = @call(.never_inline, netWriteOpImpl, .{ o.socket_handle, o.header, o.data, o.splat, timeout, clock }) catch |err| switch (err) {
                 error.Canceled => |e| return e,
                 error.Timeout => |e| return e,
                 else => |e| break :result e,
@@ -502,6 +499,15 @@ fn operateInner(operation: Io.Operation, timeout: time.Timeout, clock: time.Cloc
             break :result n;
         } },
     }
+}
+
+fn deviceIoControlOp(o: anytype, timeout: time.Timeout, clock: time.Clock) !@FieldType(Io.Operation.Result, "device_io_control") {
+    var op = if (builtin.os.tag == .windows)
+        ev.DeviceIoControl.init(stdIoHandleToZio(o.file.handle), o.code, o.in, o.out)
+    else
+        ev.DeviceIoControl.init(stdIoHandleToZio(o.file.handle), o.code, o.arg);
+    try timedWaitForIoClock(&op.c, timeout, clock);
+    return try op.getResult();
 }
 
 /// Read from `file` at its current position into `data`, advancing the
