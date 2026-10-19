@@ -2257,9 +2257,6 @@ pub const Runtime = struct {
         return @import("io.zig").fromRuntime(self, .blocking);
     }
 
-    /// Recover the `*Runtime` from a `std.Io` produced by `Runtime.io()`
-    /// or `Runtime.blockingIo()`, or null when it is backed by some other
-    /// implementation.
     /// The index of the calling thread's executor in this runtime (what
     /// `Placement.executor` takes), or null when the thread is not one of
     /// its executors.
@@ -2269,6 +2266,9 @@ pub const Runtime = struct {
         return exec.id;
     }
 
+    /// Recover the `*Runtime` from a `std.Io` produced by `Runtime.io()`
+    /// or `Runtime.blockingIo()`, or null when it is backed by some other
+    /// implementation.
     pub fn fromIo(value: std.Io) ?*Runtime {
         const io_impl = @import("io.zig");
         if (value.vtable != &io_impl.vtable or value.userdata == null) return null;
