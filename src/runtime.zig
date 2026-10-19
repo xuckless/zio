@@ -532,6 +532,9 @@ pub const Executor = struct {
 
     stealing: Stealing = .{},
 
+    // Stacks and task allocations for tasks spawned here (owner only).
+    spawn_cache: @import("task.zig").SpawnCache = .{},
+
     // Deferred cleanup for the task that just yielded away from this executor.
     // Processed by the next coroutine to run (at landing sites: startFn, yield resume, run loop).
     pending_cleanup: TaskCleanup = .none,
@@ -704,6 +707,7 @@ pub const Executor = struct {
     }
 
     pub fn deinit(self: *Executor) void {
+        self.spawn_cache.drain(self.runtime);
         setCurrentExecutor(null);
         Coroutine.clearCurrent();
 
@@ -1425,7 +1429,7 @@ pub const Executor = struct {
             .finish => |task| {
                 self.pending_cleanup = .none;
                 task.state.store(.{ .tag = .finished }, .release);
-                task.releaseCoro(self.runtime);
+                task.releaseCoroLocal(self);
                 finishTask(self.runtime, &task.awaitable);
             },
         }
