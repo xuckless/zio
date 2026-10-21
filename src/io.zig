@@ -5175,6 +5175,8 @@ test "io: receiveManyTimeout returns every datagram already queued" {
 }
 
 test "io: sendManyTimeout and receiveManyTimeout carry several datagrams with control messages" {
+    // IP_RECVTOS and its control message are POSIX only.
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
     const rt = try Runtime.init(std.testing.allocator, .{});
     defer rt.deinit();
     const io = rt.io();
