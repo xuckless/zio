@@ -18,10 +18,12 @@ NO_EXEC=false
 COVERAGE=false
 TIMEOUT=""
 NO_LOG_CAPTURE=false
+FAST_ACCEPT=false
+DEBUG_CANCEL=false
 
 # Parse arguments
 usage() {
-  echo "Usage: $0 [--filter \"test name\"] [--target <target>] [--backend <backend>] [--scheduling <mode>] [--wine] [--qemu] [--no-exec] [--coverage] [--ci] [--full] [--release] [--verbose] [--no-log-capture] [--timeout <seconds>]"
+  echo "Usage: $0 [--filter \"test name\"] [--target <target>] [--backend <backend>] [--scheduling <mode>] [--wine] [--qemu] [--no-exec] [--coverage] [--ci] [--full] [--release] [--fast-accept] [--debug-cancel] [--verbose] [--no-log-capture] [--timeout <seconds>]"
 }
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -81,6 +83,14 @@ while [[ $# -gt 0 ]]; do
             NO_LOG_CAPTURE=true
             shift
             ;;
+        --fast-accept)
+            FAST_ACCEPT=true
+            shift
+            ;;
+        --debug-cancel)
+            DEBUG_CANCEL=true
+            shift
+            ;;
         --timeout)
             [[ $# -ge 2 ]] || { echo "--timeout requires an argument"; usage; exit 1; }
             TIMEOUT="$2"; shift 2
@@ -120,6 +130,15 @@ fi
 if [ -n "$SCHEDULING" ]; then
     echo "Scheduling: $SCHEDULING"
     BUILD_ARGS+=("-Dscheduling=$SCHEDULING")
+fi
+
+if [ "$FAST_ACCEPT" = true ]; then
+    echo "Fast accept: on"
+    BUILD_ARGS+=("-Dfast_accept=true")
+fi
+if [ "$DEBUG_CANCEL" = true ]; then
+    echo "Debug cancel: on"
+    BUILD_ARGS+=("-Ddebug_cancel=true")
 fi
 
 if [ -n "$BACKEND" ]; then

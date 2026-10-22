@@ -8,6 +8,9 @@ const assert = std.debug.assert;
 const zio_options = @import("options.zig").options;
 const multi_executor = zio_options.scheduling.multiExecutor();
 const migrates = zio_options.scheduling.migrates();
+/// See `RuntimeOptions.idle_stack_trim`: a task's executor trims its stack,
+/// which needs the task to stay there.
+const idle_trim_supported = !migrates and @import("coro/stack.zig").can_trim;
 
 const ev = @import("ev/root.zig");
 const os = @import("os/root.zig");
@@ -138,6 +141,17 @@ pub const RuntimeOptions = struct {
         .maximum_size = 8 * 1024 * 1024,
         .committed_size = 256 * 1024,
     },
+    /// A task suspended this long (give or take as much again: the
+    /// executor checks at this interval) gives the OS back the stack pages
+    /// below where it waits. A task keeps every stack page it ever touched,
+    /// so one that went deep once (a request through its handler, a TLS
+    /// handshake) and then waits at a shallow depth (an idle keep-alive
+    /// connection, a WebSocket) would hold the deep path's pages for the
+    /// whole wait. One madvise per task per wait that lasts; a task woken
+    /// sooner costs nothing. `.zero` turns it off. Only where tasks stay on
+    /// their executor (single-executor and pinned scheduling), and only on
+    /// Linux (x86_64, aarch64).
+    idle_stack_trim: Duration = .fromSeconds(1),
     /// When non-zero, a monitor thread logs the scheduler counters'
     /// per-interval deltas at this cadence. A dedicated thread rather than
     /// an executor timer, so it keeps reporting even when every executor is
@@ -518,6 +532,9 @@ pub const Executor = struct {
 
     stealing: Stealing = .{},
 
+    // Stacks and task allocations for tasks spawned here (owner only).
+    spawn_cache: @import("task.zig").SpawnCache = .{},
+
     // Deferred cleanup for the task that just yielded away from this executor.
     // Processed by the next coroutine to run (at landing sites: startFn, yield resume, run loop).
     pending_cleanup: TaskCleanup = .none,
@@ -538,6 +555,10 @@ pub const Executor = struct {
     // Periodic timer driving the stack pool's watermark shrink pass. The
     // pool rate-limits itself, so every executor may carry this timer.
     stack_pool_shrink_timer: ev.Timer = ev.Timer.init(.{ .duration = .fromSeconds(60) }),
+    /// Tasks waiting since `AnyTask.idle.since`, oldest first, until their
+    /// stacks are trimmed or they run again (`RuntimeOptions.idle_stack_trim`).
+    idle_tasks: std.DoublyLinkedList = .{},
+    idle_trim_timer: ev.Timer = ev.Timer.init(.{ .duration = .fromSeconds(1) }),
 
     // The task currently executing on this executor, or null when we are running
     // scheduler code (the run loop, a context switch, a completion callback) rather
@@ -547,6 +568,20 @@ pub const Executor = struct {
     // Updated before every context switch into a task and after every switch back.
     // Used by getCurrentTaskOrNull() instead of the TLS current_context chain.
     current_task: ?*AnyTask,
+
+    // Spawns made while the ready queue was past the spawn backpressure
+    // threshold since the last backpressure yield (see registerTask).
+    spawns_past_threshold: u32 = 0,
+
+    // Tasks taken off the run queue (owner only, wrapping): across a yield to
+    // the back of the queue, the difference is how many ran ahead of the
+    // yielding task.
+    runs: u32 = 0,
+
+    // How many tasks ran ahead of the last task that went to the back of the
+    // queue to let others run (`yieldForRound`): about how many were ready
+    // then. See `roundBudget`.
+    last_round: u32 = 0,
 
     // Depth of no-suspend regions on this thread; see `beginNoSuspend`. Unlike
     // clearing `current_task`, this leaves the task identity visible to locks,
@@ -628,12 +663,61 @@ pub const Executor = struct {
             self.loop.add(&self.stack_pool_shrink_timer.c);
         }
 
+        if (comptime idle_trim_supported) {
+            const after = self.runtime.options.idle_stack_trim;
+            if (after.value > 0) {
+                self.idle_trim_timer = ev.Timer.init(.{ .duration = after });
+                self.idle_trim_timer.c.callback = idleTrimCallback;
+                self.idle_trim_timer.c.flags.rearm = true;
+                self.loop.add(&self.idle_trim_timer.c);
+            }
+        }
+
         self.main_task.coro.setCurrent();
         setCurrentExecutor(self);
         self.current_task = &self.main_task;
     }
 
+    /// Trims the stacks of the tasks waiting since an interval ago or
+    /// longer, once per wait. The list is in the order they parked, so the
+    /// walk stops at the first one still young.
+    fn idleTrimCallback(loop: *ev.Loop, c: *ev.Completion) void {
+        const timer = c.cast(ev.Timer);
+        const self: *Executor = @alignCast(@fieldParentPtr("idle_trim_timer", timer));
+        const cutoff = loop.now();
+        const after = self.runtime.options.idle_stack_trim;
+        while (self.idle_tasks.first) |node| {
+            const task: *AnyTask = @fieldParentPtr("idle_node", node);
+            if (task.idle_since.addDuration(after).value > cutoff.value) break;
+            self.unlistIdle(task);
+            const ctx = &task.coro.context;
+            const sp: usize = switch (builtin.cpu.arch) {
+                .x86_64 => ctx.rsp,
+                .aarch64 => ctx.sp,
+                else => unreachable,
+            };
+            @import("coro/stack.zig").stackTrim(ctx.stack_info, sp);
+        }
+    }
+
+    /// A spawned task just parked: listed for `idleTrimCallback`.
+    fn listIdle(self: *Executor, task: *AnyTask) void {
+        if (comptime !idle_trim_supported) return;
+        if (task == &self.main_task or self.runtime.options.idle_stack_trim.value == 0) return;
+        task.idle_since = self.loop.now();
+        task.idle_listed = true;
+        self.idle_tasks.append(&task.idle_node);
+    }
+
+    fn unlistIdle(self: *Executor, task: *AnyTask) void {
+        if (comptime !idle_trim_supported) return;
+        if (!task.idle_listed) return;
+        self.idle_tasks.remove(&task.idle_node);
+        task.idle_listed = false;
+    }
+
     pub fn deinit(self: *Executor) void {
+        self.spawn_cache.drain(self.runtime);
         setCurrentExecutor(null);
         Coroutine.clearCurrent();
 
@@ -1031,17 +1115,24 @@ pub const Executor = struct {
         // Refill from the overflow queue before draining the dispatched queue:
         // overflow tasks became runnable earlier, and a busy ring has room only
         // in the slots this pass freed, which a steady completion stream would
-        // fill on every pass. A busy ring takes one task per check, which bounds
-        // an overflow task's wait; this executor is often its only consumer, as
-        // stealing takes from rings and armSearcher does nothing while nobody is
-        // idle. An empty ring takes a batch. Overflow work counts as work, so a
-        // local ring spill (which doesn't wake the loop) can't put this executor
-        // to sleep.
+        // fill on every pass. Overflow work counts as work, so a local ring
+        // spill (which doesn't wake the loop) can't put this executor to sleep.
         if (!self.run_queue.overflow.isEmpty()) {
-            if (self.run_queue.isEmpty()) {
-                _ = self.run_queue.refill(self.overflowBatch(), .block);
+            if (migrates) {
+                // The shared queue: a busy ring takes one task per check, which
+                // bounds an overflow task's wait while leaving the rest to the
+                // other executors; this executor is often its only consumer, as
+                // stealing takes from rings and armSearcher does nothing while
+                // nobody is idle. An empty ring takes a batch.
+                if (self.run_queue.isEmpty()) {
+                    _ = self.run_queue.refill(self.overflowBatch(), .block);
+                } else {
+                    _ = self.run_queue.refill(1, .try_only);
+                }
             } else {
-                _ = self.run_queue.refill(1, .try_only);
+                // This executor's own queue, which nobody else drains: take
+                // as many as the ring has room for.
+                _ = self.run_queue.fillFromOverflow();
             }
         }
         // Task wakes can enter the dispatched queue outside any poll: an
@@ -1145,9 +1236,18 @@ pub const Executor = struct {
             return null;
         }
 
-        const node = self.run_queue.pop() orelse return null;
+        const node = self.run_queue.pop() orelse blk: {
+            // Pinned: the ring ran dry within the tick while tasks wait in
+            // its overflow; take them now rather than after a poll.
+            if (migrates or self.run_queue.overflow.isEmpty()) return null;
+            if (self.run_queue.fillFromOverflow() == 0) return null;
+            break :blk self.run_queue.pop() orelse return null;
+        };
         self.spendQuantum();
-        return AnyTask.fromWaitNode(node);
+        if (zio_options.fast_accept) self.runs +%= 1;
+        const task = AnyTask.fromWaitNode(node);
+        self.unlistIdle(task);
+        return task;
     }
 
     /// Schedule a task on this executor's local run queue. MUST run on the owning
@@ -1325,9 +1425,13 @@ pub const Executor = struct {
                         self.scheduleTaskLocal(task);
                         return;
                     }
-                    // Normal: transition to .waiting
+                    // Normal: transition to .waiting. Listed first: once
+                    // .waiting, a waker may queue it, though only this
+                    // thread runs it (and unlists it) after.
+                    self.listIdle(task);
                     const desired = AnyTask.State{ .tag = .waiting, .awaken = false };
                     if (task.state.cmpxchgWeak(old, desired, .acq_rel, .acquire)) |actual| {
+                        self.unlistIdle(task);
                         old = actual;
                         continue;
                     }
@@ -1337,10 +1441,42 @@ pub const Executor = struct {
             .finish => |task| {
                 self.pending_cleanup = .none;
                 task.state.store(.{ .tag = .finished }, .release);
-                task.releaseCoro(self.runtime);
-                finishTask(self.runtime, &task.awaitable);
+                task.releaseCoroLocal(self);
+                finishTask(&task.awaitable);
             },
         }
+    }
+
+    /// How much of something a task may do in one turn before it goes to the
+    /// back of the run queue (`yieldForRound`): `floor`, or as many as the
+    /// tasks that ran ahead of the last one that went there, whichever is
+    /// more. A fixed budget against a long queue starves whatever the task
+    /// stands for: an acceptor that takes 128 connections, or a spawner that
+    /// starts 64 tasks, per pass over 25,000 busy connections leaves the
+    /// clients behind it waiting for many passes, seconds each, while each
+    /// client already in gets a turn per pass. With the budget at the
+    /// length of a pass, those waiting get in within a few passes (the
+    /// budget follows the queue as it grows), and a turn costs no more than
+    /// the tasks ahead of it took between them.
+    pub fn roundBudget(self: *const Executor, floor: u32) u32 {
+        return @max(floor, self.last_round);
+    }
+
+    /// Spawns past the backpressure threshold between yields: `floor`, or
+    /// with `fast_accept` the `roundBudget`.
+    pub fn spawnBudget(self: *const Executor, floor: u32) u32 {
+        return if (zio_options.fast_accept) self.roundBudget(floor) else floor;
+    }
+
+    /// Sends `task`, the current task on this executor, to the back of the
+    /// run queue, and notes how many tasks ran before it came back
+    /// (`roundBudget`). Not a cancellation point.
+    pub fn yieldForRound(self: *Executor, task: *AnyTask) void {
+        const before = self.runs;
+        task.yieldFrom(self, .reschedule, .no_cancel);
+        // Under work stealing the task may be back on another executor,
+        // whose count says nothing about this one's queue.
+        if (getCurrentExecutorOrNull() == self) self.last_round = self.runs -% before;
     }
 
     /// Yield the current coroutine to the next ready task or back to the run loop.
@@ -1629,7 +1765,6 @@ pub const Runtime = struct {
     main_executor: Executor,
     next_executor_index: std.atomic.Value(usize) = .init(0),
     workers: std.ArrayList(Worker) = .empty,
-    task_count: std.atomic.Value(u32) = std.atomic.Value(u32).init(0), // Active task counter
     shutting_down: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     // Worker lifecycle barriers, see runWorker(). A worker starts running
     // only once worker_start is .run, after every executor is registered, so
@@ -1869,8 +2004,13 @@ pub const Runtime = struct {
         // Stop worker executors and join threads (deinits their loops)
         self.shutdownWorkers();
 
-        // All tasks should be complete before deinit
-        std.debug.assert(self.task_count.load(.acquire) == 0);
+        // The main executor's spawn cache still holds stacks the pool counts
+        // as in use (the workers gave theirs back as they stopped).
+        if (self.options.enable_main_executor) self.main_executor.spawn_cache.drain(self);
+
+        // All tasks should be complete before deinit. A task holds its stack
+        // until it finishes, so the pool's count of stacks in use covers them.
+        std.debug.assert(self.stack_pool.in_use == 0);
 
         // Clean up ThreadPool (worker threads already joined by stop()).
         self.thread_pool.deinit();
@@ -2182,6 +2322,15 @@ pub const Runtime = struct {
     /// new work differs.
     pub fn blockingIo(self: *Runtime) std.Io {
         return @import("io.zig").fromRuntime(self, .blocking);
+    }
+
+    /// The index of the calling thread's executor in this runtime (what
+    /// `Placement.executor` takes), or null when the thread is not one of
+    /// its executors.
+    pub fn currentExecutor(self: *Runtime) ?ExecutorId {
+        const exec = getCurrentExecutorOrNull() orelse return null;
+        if (exec.runtime != self) return null;
+        return exec.id;
     }
 
     /// Recover the `*Runtime` from a `std.Io` produced by `Runtime.io()`
@@ -2713,6 +2862,42 @@ test "runtime: local ring overflow spills and drains with pinned scheduling" {
     try std.testing.expectEqual(@as(u32, H.n_tasks), counter.load(.monotonic));
 }
 
+test "runtime: a sleeping task wakes behind more yielding tasks than the ring holds" {
+    // One executor and tasks that keep yielding, more of them than the local
+    // ring holds (256): the rest wait in its overflow queue, and so does a
+    // task whose timer fires. That task must still get its turn; it waited
+    // for good while each yielding task went back into the ring slot it had
+    // just freed, ahead of everything in the overflow queue.
+    // Not under work stealing, where the overflow queue is the shared one and
+    // a full ring takes nothing from it at a work check either: the same
+    // starvation, on one executor, before and after #841 (not fixed here).
+    if (migrates) return error.SkipZigTest;
+    const rt = try Runtime.init(std.testing.allocator, .{ .executors = .exact(1) });
+    defer rt.deinit();
+
+    const W = struct {
+        stop: bool = false,
+
+        fn busy(w: *@This()) Cancelable!void {
+            while (!w.stop) try yield();
+        }
+
+        fn run(w: *@This(), io: std.Io, n: usize) !void {
+            var group: std.Io.Group = .init;
+            defer group.cancel(io);
+            defer w.stop = true;
+            for (0..n) |_| try group.concurrent(io, busy, .{w});
+            try io.sleep(.fromMilliseconds(10), .awake);
+        }
+    };
+
+    for ([_]usize{ 100, 300, 2000 }) |n| {
+        var w: W = .{};
+        var handle = try rt.spawn(W.run, .{ &w, rt.io(), n });
+        try handle.join();
+    }
+}
+
 test "runtime: spawnInto rejects fixed placements with work stealing" {
     if (!migrates) return error.SkipZigTest;
 
@@ -3151,4 +3336,73 @@ test "debug_cancel: reports a task that parks after swallowing error.Canceled" {
     propagating.cancel();
     try swallowing.join();
     try propagating.join();
+}
+
+test "Runtime: currentExecutor names the calling executor" {
+    const runtime = try Runtime.init(std.testing.allocator, .{});
+    defer runtime.deinit();
+    try std.testing.expectEqual(@as(?ExecutorId, 0), runtime.currentExecutor());
+
+    const other = try Runtime.init(std.testing.allocator, .{ .enable_main_executor = false });
+    defer other.deinit();
+    // This thread is the first runtime's executor, not the second's.
+    try std.testing.expectEqual(@as(?ExecutorId, null), other.currentExecutor());
+
+    const worker = struct {
+        fn run(rt: *Runtime) !void {
+            try std.testing.expectEqual(@as(?ExecutorId, 0), rt.currentExecutor());
+        }
+    };
+    var handle = try runtime.spawn(worker.run, .{runtime});
+    try handle.join();
+}
+
+test "Runtime: a task waiting past idle_stack_trim gives back its deeper stack pages" {
+    if (comptime !idle_trim_supported) return error.SkipZigTest;
+    const stack = @import("coro/stack.zig");
+    const runtime = try Runtime.init(std.testing.allocator, .{ .idle_stack_trim = .fromMilliseconds(20) });
+    defer runtime.deinit();
+
+    const worker = struct {
+        /// Touches about 64 KiB of stack below the caller.
+        noinline fn deep(depth: usize) u8 {
+            var buf: [4096]u8 = undefined;
+            @memset(&buf, @truncate(depth));
+            std.mem.doNotOptimizeAway(&buf);
+            if (depth == 0) return buf[0];
+            return deep(depth - 1) +% buf[depth];
+        }
+
+        /// Pages of the stack from its limit up to the page below `frame`
+        /// that are resident.
+        fn resident(info: stack.StackInfo, frame: usize) !usize {
+            const ps = std.heap.pageSize();
+            const end = std.mem.alignBackward(usize, frame, ps) - ps;
+            var vec: [512]u8 = undefined;
+            const pages = (end - info.limit) / ps;
+            std.debug.assert(pages <= vec.len);
+            const rc = std.os.linux.mincore(@ptrFromInt(info.limit), end - info.limit, &vec);
+            if (std.os.linux.errno(rc) != .SUCCESS) return error.Mincore;
+            var n: usize = 0;
+            for (vec[0..pages]) |v| n += v & 1;
+            return n;
+        }
+
+        fn run(rt: *Runtime) !void {
+            const info = getCurrentTask().coro.context.stack_info;
+            _ = deep(16);
+            const frame = @frameAddress();
+            try std.testing.expect(try resident(info, frame) >= 16);
+            // A short wait keeps them.
+            try rt.sleep(.fromMicroseconds(100));
+            try std.testing.expect(try resident(info, frame) >= 16);
+            // A long one does not, deeper than the sleep's own frames.
+            try rt.sleep(.fromMilliseconds(100));
+            try std.testing.expect(try resident(info, frame) <= 2);
+            // The stack still works below, on zeroed pages.
+            _ = deep(16);
+        }
+    };
+    var handle = try runtime.spawn(worker.run, .{runtime});
+    try handle.join();
 }

@@ -18,6 +18,7 @@ const registerGroupTask = @import("group.zig").registerGroupTask;
 const unregisterGroupTask = @import("group.zig").unregisterGroupTask;
 const os = @import("os/root.zig");
 const Timestamp = @import("time.zig").Timestamp;
+const StackInfo = @import("coro/stack.zig").StackInfo;
 const zio_options = @import("options.zig").options;
 
 pub const Closure = struct {
@@ -197,6 +198,13 @@ pub const AnyTask = struct {
     closure: Closure,
 
     runtime: *Runtime,
+
+    /// On its executor's list of waiting tasks whose stacks are not trimmed
+    /// yet (`RuntimeOptions.idle_stack_trim`); only that executor touches
+    /// these.
+    idle_node: std.DoublyLinkedList.Node = .{},
+    idle_since: Timestamp = .zero,
+    idle_listed: bool = false,
 
     /// Head of this task's intrusive task-local binding chain (see `TaskLocal`).
     /// Only ever accessed by the task itself, so it needs no synchronization.
@@ -575,6 +583,18 @@ pub const AnyTask = struct {
         self.coro.deinit();
     }
 
+    /// `releaseCoro` on the executor the task finished on, from its finish
+    /// cleanup: the stack goes to the executor's spawn cache while it has
+    /// room, for the next task spawned there, without the pool's lock.
+    pub fn releaseCoroLocal(self: *AnyTask, executor: *Executor) void {
+        if (self.coro.context.stack_info.allocation_len == 0) return;
+        if (!executor.spawn_cache.putStack(self.coro.context.stack_info)) {
+            return self.releaseCoro(executor.runtime);
+        }
+        self.coro.context.stack_info.allocation_len = 0;
+        self.coro.deinit();
+    }
+
     pub fn destroy(self: *AnyTask) void {
         const rt = self.getRuntime();
         self.releaseCoro(rt);
@@ -642,8 +662,13 @@ pub const AnyTask = struct {
         };
 
         // Acquire stack from pool and initialize context. Nothing below can
-        // fail, so the acquired stack needs no errdefer release here.
-        self.coro.context.stack_info = try executor.runtime.stack_pool.acquire();
+        // fail, so the acquired stack needs no errdefer release here. A task
+        // spawned on the executor running this code takes one from its
+        // spawn cache first.
+        self.coro.context.stack_info = if (runtime.getCurrentExecutorOrNull() == executor)
+            executor.spawn_cache.takeStack() orelse try executor.runtime.stack_pool.acquire()
+        else
+            try executor.runtime.stack_pool.acquire();
 
         // Copy context data into the allocation
         const context_dest = self.closure.getContextSlice(AnyTask, self);
@@ -780,41 +805,49 @@ const Placement = @import("runtime.zig").Placement;
 
 /// Ready-queue length past which a spawning task yields to let new tasks start.
 const spawn_yield_threshold = 13;
+/// Spawns past the threshold between those yields: each one by default; with
+/// `fast_accept`, 64 at the least, and more when the queue is longer
+/// (`Executor.roundBudget`).
+const spawn_yield_burst = if (zio_options.fast_accept) 64 else 1;
 
 /// Register a task with the runtime and schedule it for execution.
 /// Increments its reference count, adds the task to the runtime's task list,
 /// and schedules it on its executor.
 /// Returns error.RuntimeShutdown if the runtime is shutting down.
 pub fn registerTask(rt: *Runtime, task: *AnyTask) error{RuntimeShutdown}!void {
-    // Check if runtime is shutting down before incrementing counter
     if (rt.shutting_down.load(.acquire)) {
         return error.RuntimeShutdown;
     }
-
-    _ = rt.task_count.fetchAdd(1, .acq_rel);
 
     Executor.scheduleTask(task);
 
     if (runtime.getCurrentExecutorOrNull()) |current_executor| {
         if (current_executor.runtime == task.runtime) {
             // Backpressure for spawn loops: once the ready queue grows past the
-            // threshold, yield so new tasks start running instead of piling up
-            // (distinct from maybeYield's time-slice check). Only needed when
-            // no other executor can steal the backlog.
+            // threshold, yield every spawn_yield_burst spawns so new tasks
+            // start running instead of piling up (distinct from maybeYield's
+            // time-slice check). With `fast_accept`, not on every spawn: a
+            // queue long with other work (thousands of busy connections)
+            // would send an accept loop to the back of it after each
+            // connection, which held a pinned executor to ~70 accepts a
+            // second at 4096 connections; nor every 64 when the queue is much
+            // longer than that, which held one to ~900 a second at 25,000
+            // (`Executor.roundBudget`). Only needed when no other executor
+            // can steal the backlog.
             if (!rt.stealingActive() and current_executor.run_queue.len() >= spawn_yield_threshold) {
-                if (current_executor.current_task) |spawner| {
-                    spawner.yield(.reschedule, .no_cancel);
+                current_executor.spawns_past_threshold += 1;
+                if (current_executor.spawns_past_threshold >= current_executor.spawnBudget(spawn_yield_burst)) {
+                    if (current_executor.current_task) |spawner| {
+                        current_executor.spawns_past_threshold = 0;
+                        current_executor.yieldForRound(spawner);
+                    }
                 }
             }
         }
     }
 }
 
-pub fn finishTask(rt: *Runtime, awaitable: *Awaitable) void {
-    // Decrement task count BEFORE marking complete to prevent race where
-    // waiting thread wakes up and sees non-zero task_count in deinit()
-    _ = rt.task_count.fetchSub(1, .acq_rel);
-
+pub fn finishTask(awaitable: *Awaitable) void {
     // Mark awaitable as complete and wake all waiters
     awaitable.markComplete();
 
@@ -873,6 +906,67 @@ pub fn spawnTask(
     return task;
 }
 
+/// The spawn cache of the executor running this code, if it belongs to
+/// `rt`.
+fn localCache(rt: *Runtime) ?*SpawnCache {
+    const executor = runtime.getCurrentExecutorOrNull() orelse return null;
+    if (executor.runtime != rt) return null;
+    return &executor.spawn_cache;
+}
+
+/// What tasks that ended on an executor leave behind for the next ones
+/// spawned there: their stacks and task allocations. Spawning a task and
+/// finishing one each took the runtime-wide stack pool's and task pool's
+/// locks, which every executor shares; with a task per request, that is
+/// millions of times a second across cores. Only the owning executor's
+/// thread touches its cache; what does not fit goes back to the pools, and
+/// the executor returns the rest when it stops (`drain`).
+pub const SpawnCache = struct {
+    pub const len = 32;
+    const Item = @FieldType(TaskPool, "pool").ItemPtr;
+
+    stacks: [len]StackInfo = undefined,
+    stack_count: u8 = 0,
+    tasks: [len]Item = undefined,
+    task_count: u8 = 0,
+
+    fn takeStack(self: *SpawnCache) ?StackInfo {
+        if (self.stack_count == 0) return null;
+        self.stack_count -= 1;
+        return self.stacks[self.stack_count];
+    }
+
+    fn putStack(self: *SpawnCache, info: StackInfo) bool {
+        if (self.stack_count == len) return false;
+        self.stacks[self.stack_count] = info;
+        self.stack_count += 1;
+        return true;
+    }
+
+    fn takeTask(self: *SpawnCache) ?[]align(Closure.task_alignment) u8 {
+        if (self.task_count == 0) return null;
+        self.task_count -= 1;
+        return self.tasks[self.task_count];
+    }
+
+    fn putTask(self: *SpawnCache, item: Item) bool {
+        if (self.task_count == len) return false;
+        self.tasks[self.task_count] = item;
+        self.task_count += 1;
+        return true;
+    }
+
+    /// Everything back to the runtime's pools.
+    pub fn drain(self: *SpawnCache, rt: *Runtime) void {
+        for (self.stacks[0..self.stack_count]) |info| rt.stack_pool.release(info);
+        self.stack_count = 0;
+        rt.task_pool.mutex.lock();
+        for (self.tasks[0..self.task_count]) |item| rt.task_pool.pool.destroy(item);
+        rt.task_pool.mutex.unlock();
+        self.task_count = 0;
+    }
+};
+
 pub const TaskPool = struct {
     pub const pool_item_size = std.mem.alignForward(usize, @sizeOf(AnyTask) + 128, 128);
 
@@ -891,6 +985,7 @@ pub const TaskPool = struct {
 
     pub fn alloc(self: *TaskPool, rt: *Runtime, size: usize) ![]align(Closure.task_alignment) u8 {
         if (size <= pool_item_size) {
+            if (localCache(rt)) |cache| if (cache.takeTask()) |item| return item;
             self.mutex.lock();
             defer self.mutex.unlock();
             const ptr = try self.pool.create();
@@ -902,6 +997,7 @@ pub const TaskPool = struct {
 
     pub fn free(self: *TaskPool, rt: *Runtime, slice: []align(Closure.task_alignment) u8) void {
         if (slice.len <= pool_item_size) {
+            if (localCache(rt)) |cache| if (cache.putTask(@ptrCast(@alignCast(slice.ptr)))) return;
             self.mutex.lock();
             defer self.mutex.unlock();
             self.pool.destroy(@ptrCast(slice.ptr));

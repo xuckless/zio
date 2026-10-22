@@ -266,6 +266,30 @@ pub const FILE_BEGIN: DWORD = 0;
 pub const FILE_CURRENT: DWORD = 1;
 pub const FILE_END: DWORD = 2;
 
+pub extern "kernel32" fn CreateEventExW(
+    lpEventAttributes: ?*SECURITY_ATTRIBUTES,
+    lpName: ?LPCWSTR,
+    dwFlags: DWORD,
+    dwDesiredAccess: DWORD,
+) callconv(.winapi) ?HANDLE;
+
+pub const CREATE_EVENT_MANUAL_RESET: DWORD = 0x1;
+pub const EVENT_ALL_ACCESS: DWORD = 0x1F0003;
+
+/// FILE_MODE_INFORMATION.Mode bits: a handle opened without either is
+/// for overlapped I/O, with no file pointer kept by the system.
+pub const FILE_SYNCHRONOUS_IO_ALERT: ULONG = 0x10;
+pub const FILE_SYNCHRONOUS_IO_NONALERT: ULONG = 0x20;
+
+/// Whether `handle` was opened for overlapped I/O (FILE_FLAG_OVERLAPPED).
+pub fn isOverlapped(handle: HANDLE) bool {
+    var iosb: IO_STATUS_BLOCK = undefined;
+    var mode: ULONG = 0;
+    const status = NtQueryInformationFile(handle, &iosb, @ptrCast(&mode), @sizeOf(ULONG), .FileModeInformation);
+    if (status != .SUCCESS) return false;
+    return mode & (FILE_SYNCHRONOUS_IO_ALERT | FILE_SYNCHRONOUS_IO_NONALERT) == 0;
+}
+
 /// Returns true if `handle` is not seekable (pipe, socket, character device),
 /// in which case only streaming (positionless, zero-offset overlapped) I/O works
 /// and positional I/O is unavailable. Mirrors the POSIX lseek/ESPIPE probe: a
@@ -1244,6 +1268,12 @@ pub const SO_UPDATE_CONNECT_CONTEXT: i32 = 0x7010;
 
 // WSAIoctl codes
 pub const SIO_GET_EXTENSION_FUNCTION_POINTER: DWORD = 0xc8000006;
+/// _WSAIOW(IOC_VENDOR, 12): whether an ICMP port unreachable for an earlier
+/// datagram fails the next receive on a UDP socket with WSAECONNRESET.
+pub const SIO_UDP_CONNRESET: DWORD = 0x9800000C;
+/// _WSAIOW(IOC_VENDOR, 15): the same for an ICMP time exceeded, as
+/// WSAENETRESET.
+pub const SIO_UDP_NETRESET: DWORD = 0x9800000F;
 
 /// Errors that can occur when converting a path to wide string.
 pub const PathToWideError = error{

@@ -310,6 +310,20 @@ pub const OpenError = error{
     Unexpected,
 };
 
+/// Windows fails the next receive on an unconnected UDP socket with
+/// WSAECONNRESET when an ICMP port unreachable comes back for a datagram it
+/// sent earlier (and with WSAENETRESET for an ICMP time exceeded), unlike
+/// POSIX systems: one peer that went away would break the receive loop
+/// that serves all the others. Both reports are turned off, as libuv and Go
+/// do. Best-effort.
+fn disableUdpResetReports(sock: fd_t) void {
+    const off: windows.BOOL = windows.FALSE;
+    var returned: windows.DWORD = 0;
+    for ([_]windows.DWORD{ windows.SIO_UDP_CONNRESET, windows.SIO_UDP_NETRESET }) |code| {
+        _ = windows.WSAIoctl(sock, code, &off, @sizeOf(windows.BOOL), null, 0, &returned, null, null);
+    }
+}
+
 pub fn socket(domain: Domain, socket_type: Type, protocol: Protocol, flags: OpenFlags) OpenError!fd_t {
     switch (builtin.os.tag) {
         .windows => {
@@ -329,6 +343,7 @@ pub fn socket(domain: Domain, socket_type: Type, protocol: Protocol, flags: Open
                 var mode: c_ulong = 1;
                 _ = windows.ioctlsocket(sock, windows.FIONBIO, &mode);
             }
+            if (socket_type == .dgram) disableUdpResetReports(sock);
             return sock;
         },
         else => {
@@ -1169,6 +1184,12 @@ pub const SendFlags = packed struct {
     eor: bool = false,
     oob: bool = false,
     fastopen: bool = false,
+    /// Fail with `error.WouldBlock` instead of blocking in the send syscall
+    /// when the socket can't take the data. On POSIX this is MSG_DONTWAIT and
+    /// holds regardless of the socket's blocking mode. Windows has no such
+    /// flag, so there it relies on the socket being in FIONBIO mode. It does
+    /// not stop an operation from waiting for the socket to become writable.
+    dontwait: bool = false,
 };
 
 fn sendFlagsToSys(flags: SendFlags) c_int {
@@ -1180,6 +1201,7 @@ fn sendFlagsToSys(flags: SendFlags) c_int {
     if (flags.eor and @hasDecl(MSG, "EOR")) sys_flags |= MSG.EOR;
     if (flags.oob and @hasDecl(MSG, "OOB")) sys_flags |= MSG.OOB;
     if (flags.fastopen and @hasDecl(MSG, "FASTOPEN")) sys_flags |= MSG.FASTOPEN;
+    if (flags.dontwait and @hasDecl(MSG, "DONTWAIT")) sys_flags |= MSG.DONTWAIT;
     return sys_flags;
 }
 
@@ -1538,21 +1560,44 @@ pub const has_recvmmsg = switch (builtin.os.tag) {
     else => false,
 };
 
-pub const mmsghdr = if (has_recvmmsg) posix.system.mmsghdr else struct {};
+pub const has_sendmmsg = switch (builtin.os.tag) {
+    .linux, .freebsd, .netbsd => true,
+    else => false,
+};
+
+pub const mmsghdr = switch (builtin.os.tag) {
+    .linux, .netbsd => posix.system.mmsghdr,
+    // msg_len is ssize_t on FreeBSD; std.c declares it as u32.
+    .freebsd => extern struct {
+        hdr: posix.system.msghdr,
+        len: isize,
+    },
+    else => struct {},
+};
 
 pub fn recvmmsg(
     fd: fd_t,
     msgvec: [*]mmsghdr,
     vlen: u32,
     flags: RecvFlags,
+    /// Some message has room for control messages: received descriptors
+    /// are made close-on-exec, as `recvmsg` does.
+    with_control: bool,
 ) RecvError!u32 {
-    const sys_flags = recvFlagsToSys(flags);
+    const has_cmsg_cloexec = @hasDecl(posix.system.MSG, "CMSG_CLOEXEC");
+    const cloexec_flag: c_int = if (has_cmsg_cloexec and with_control) posix.system.MSG.CMSG_CLOEXEC else 0;
+    const sys_flags = recvFlagsToSys(flags) | cloexec_flag;
 
     while (true) {
         const rc = recvmmsg_syscall(fd, msgvec, vlen, @intCast(sys_flags));
 
         switch (posix.errno(rc)) {
-            .SUCCESS => return @intCast(rc),
+            .SUCCESS => {
+                if (!has_cmsg_cloexec and with_control) for (msgvec[0..@intCast(rc)]) |m| {
+                    if (m.hdr.controllen > 0) setReceivedFdsCloexec(@as([*]const u8, @ptrCast(m.hdr.control.?))[0..m.hdr.controllen]);
+                };
+                return @intCast(rc);
+            },
             .INTR => continue,
             else => |err| return errnoToRecvError(err),
         }
@@ -1561,21 +1606,59 @@ pub fn recvmmsg(
 
 fn recvmmsg_syscall(fd: fd_t, msgvec: [*]mmsghdr, vlen: u32, flags: c_int) switch (builtin.os.tag) {
     .linux => usize,
+    .freebsd => isize,
     else => c_int,
 } {
     switch (builtin.os.tag) {
         .linux => return posix.system.recvmmsg(fd, msgvec, vlen, @intCast(flags), null),
-        .freebsd, .netbsd => return recvmmsg_libc(fd, msgvec, vlen, flags, null),
+        .freebsd, .netbsd => return mmsg_libc.recvmmsg(fd, msgvec, vlen, @bitCast(flags), null),
         else => unreachable,
     }
 }
 
-const recvmmsg_libc = if (builtin.os.tag == .freebsd or builtin.os.tag == .netbsd)
-    struct {
-        extern "c" fn recvmmsg(sockfd: fd_t, msgvec: [*]mmsghdr, vlen: c_uint, flags: c_int, timeout: ?*posix.system.timespec) c_int;
-    }.recvmmsg
-else
-    void;
+fn sendmmsg_syscall(fd: fd_t, msgvec: [*]mmsghdr, vlen: u32, flags: c_int) switch (builtin.os.tag) {
+    .linux => usize,
+    .freebsd => isize,
+    else => c_int,
+} {
+    switch (builtin.os.tag) {
+        .linux => return posix.system.sendmmsg(fd, msgvec, vlen, @intCast(flags)),
+        .freebsd, .netbsd => return mmsg_libc.sendmmsg(fd, msgvec, vlen, @bitCast(flags)),
+        else => unreachable,
+    }
+}
+
+/// As each libc declares them in sys/socket.h.
+const mmsg_libc = switch (builtin.os.tag) {
+    .freebsd => struct {
+        extern "c" fn recvmmsg(sockfd: fd_t, msgvec: [*]mmsghdr, vlen: usize, flags: c_int, timeout: ?*const posix.system.timespec) isize;
+        extern "c" fn sendmmsg(sockfd: fd_t, msgvec: [*]mmsghdr, vlen: usize, flags: c_int) isize;
+    },
+    .netbsd => struct {
+        extern "c" fn recvmmsg(sockfd: fd_t, msgvec: [*]mmsghdr, vlen: c_uint, flags: c_uint, timeout: ?*posix.system.timespec) c_int;
+        extern "c" fn sendmmsg(sockfd: fd_t, msgvec: [*]mmsghdr, vlen: c_uint, flags: c_uint) c_int;
+    },
+    else => struct {},
+};
+
+pub fn sendmmsg(
+    fd: fd_t,
+    msgvec: [*]mmsghdr,
+    vlen: u32,
+    flags: SendFlags,
+) SendError!u32 {
+    const sys_flags = sendFlagsToSys(flags);
+
+    while (true) {
+        const rc = sendmmsg_syscall(fd, msgvec, vlen, sys_flags);
+
+        switch (posix.errno(rc)) {
+            .SUCCESS => return @intCast(rc),
+            .INTR => continue,
+            else => |err| return errnoToSendError(err),
+        }
+    }
+}
 
 pub fn sendmsg(
     fd: fd_t,
