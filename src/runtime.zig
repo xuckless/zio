@@ -578,6 +578,16 @@ pub const Executor = struct {
     // threshold since the last backpressure yield (see registerTask).
     spawns_past_threshold: u32 = 0,
 
+    // Tasks taken off the run queue (owner only, wrapping): across a yield to
+    // the back of the queue, the difference is how many ran ahead of the
+    // yielding task.
+    runs: u32 = 0,
+
+    // How many tasks ran ahead of the last task that went to the back of the
+    // queue to let others run (`yieldForRound`): about how many were ready
+    // then. See `roundBudget`.
+    last_round: u32 = 0,
+
     // Depth of no-suspend regions on this thread; see `beginNoSuspend`. Unlike
     // clearing `current_task`, this leaves the task identity visible to locks,
     // user log callbacks and the wake path's "inside the run loop" test.
@@ -1239,6 +1249,7 @@ pub const Executor = struct {
             break :blk self.run_queue.pop() orelse return null;
         };
         self.spendQuantum();
+        if (zio_options.fast_accept) self.runs +%= 1;
         const task = AnyTask.fromWaitNode(node);
         self.unlistIdle(task);
         return task;
@@ -1439,6 +1450,38 @@ pub const Executor = struct {
                 finishTask(self.runtime, &task.awaitable);
             },
         }
+    }
+
+    /// How much of something a task may do in one turn before it goes to the
+    /// back of the run queue (`yieldForRound`): `floor`, or as many as the
+    /// tasks that ran ahead of the last one that went there, whichever is
+    /// more. A fixed budget against a long queue starves whatever the task
+    /// stands for: an acceptor that takes 128 connections, or a spawner that
+    /// starts 64 tasks, per pass over 25,000 busy connections leaves the
+    /// clients behind it waiting for many passes, seconds each, while each
+    /// client already in gets a turn per pass. With the budget at the
+    /// length of a pass, those waiting get in within a few passes (the
+    /// budget follows the queue as it grows), and a turn costs no more than
+    /// the tasks ahead of it took between them.
+    pub fn roundBudget(self: *const Executor, floor: u32) u32 {
+        return @max(floor, self.last_round);
+    }
+
+    /// Spawns past the backpressure threshold between yields: `floor`, or
+    /// with `fast_accept` the `roundBudget`.
+    pub fn spawnBudget(self: *const Executor, floor: u32) u32 {
+        return if (zio_options.fast_accept) self.roundBudget(floor) else floor;
+    }
+
+    /// Sends `task`, the current task on this executor, to the back of the
+    /// run queue, and notes how many tasks ran before it came back
+    /// (`roundBudget`). Not a cancellation point.
+    pub fn yieldForRound(self: *Executor, task: *AnyTask) void {
+        const before = self.runs;
+        task.yieldFrom(self, .reschedule, .no_cancel);
+        // Under work stealing the task may be back on another executor,
+        // whose count says nothing about this one's queue.
+        if (getCurrentExecutorOrNull() == self) self.last_round = self.runs -% before;
     }
 
     /// Yield the current coroutine to the next ready task or back to the run loop.
