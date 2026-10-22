@@ -805,8 +805,10 @@ const Placement = @import("runtime.zig").Placement;
 
 /// Ready-queue length past which a spawning task yields to let new tasks start.
 const spawn_yield_threshold = 13;
-/// Spawns past the threshold between those yields.
-const spawn_yield_burst = 64;
+/// Spawns past the threshold between those yields: each one by default; with
+/// `fast_accept`, 64 at the least, and more when the queue is longer
+/// (`Executor.roundBudget`).
+const spawn_yield_burst = if (zio_options.fast_accept) 64 else 1;
 
 /// Register a task with the runtime and schedule it for execution.
 /// Increments its reference count, adds the task to the runtime's task list,
@@ -824,17 +826,20 @@ pub fn registerTask(rt: *Runtime, task: *AnyTask) error{RuntimeShutdown}!void {
             // Backpressure for spawn loops: once the ready queue grows past the
             // threshold, yield every spawn_yield_burst spawns so new tasks
             // start running instead of piling up (distinct from maybeYield's
-            // time-slice check). Not on every spawn: a queue long with other
-            // work (thousands of busy connections) would send an accept loop
-            // to the back of it after each connection, which held a pinned
-            // executor to ~70 accepts a second at 4096 connections. Only
-            // needed when no other executor can steal the backlog.
+            // time-slice check). With `fast_accept`, not on every spawn: a
+            // queue long with other work (thousands of busy connections)
+            // would send an accept loop to the back of it after each
+            // connection, which held a pinned executor to ~70 accepts a
+            // second at 4096 connections; nor every 64 when the queue is much
+            // longer than that, which held one to ~900 a second at 25,000
+            // (`Executor.roundBudget`). Only needed when no other executor
+            // can steal the backlog.
             if (!rt.stealingActive() and current_executor.run_queue.len() >= spawn_yield_threshold) {
                 current_executor.spawns_past_threshold += 1;
-                if (current_executor.spawns_past_threshold >= spawn_yield_burst) {
+                if (current_executor.spawns_past_threshold >= current_executor.spawnBudget(spawn_yield_burst)) {
                     if (current_executor.current_task) |spawner| {
                         current_executor.spawns_past_threshold = 0;
-                        spawner.yield(.reschedule, .no_cancel);
+                        current_executor.yieldForRound(spawner);
                     }
                 }
             }

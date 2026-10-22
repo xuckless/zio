@@ -2221,13 +2221,14 @@ fn netAcceptImpl(_: ?*anyopaque, server: Io.net.Socket.Handle, _: Io.net.Server.
 }
 
 /// Direct accepts in a row on this executor thread; see `acceptNow`.
-threadlocal var accept_burst: u8 = 0;
-/// Tokio's per-task coop budget.
-const max_accept_burst = 128;
+threadlocal var accept_burst: u32 = 0;
+/// Tokio's per-task coop budget: the least an acceptor takes in a turn.
+const min_accept_burst = 128;
 
-/// Accept a connection already waiting in the backlog without going through
-/// the loop, as Go's and Tokio's accept do; null when none is waiting (or on
-/// an error, which the loop path then reports).
+/// With `fast_accept` (otherwise null at once): accept a connection already
+/// waiting in the backlog without going through the loop, as Go's and
+/// Tokio's accept do; null when none is waiting (or on an error, which the
+/// loop path then reports).
 ///
 /// Going through the loop parks the task even when the accept completes at
 /// once, and the park puts it behind every other ready task: with thousands
@@ -2235,20 +2236,26 @@ const max_accept_burst = 128;
 /// pass over the run queue (~70/s at 4096 connections) while the backlog
 /// waited. The tick budget is no bound here either, since the busy
 /// connections have spent most of it by the time the acceptor runs. So, like
-/// Tokio, the acceptor gets a budget of its own: up to `max_accept_burst`
-/// connections in a row, then one trip through the loop, which yields.
+/// Tokio, the acceptor gets a budget of its own: connections in a row up to
+/// `min_accept_burst`, or as many as the tasks that ran during its last trip
+/// to the back of the run queue if that is more (`Executor.roundBudget`),
+/// then another trip there. A fixed 128 per pass held one executor serving
+/// 25,000 busy connections to ~900 accepts a second, so a client connecting
+/// as many others did waited many seconds for its first byte while every
+/// client already in was served each pass.
 ///
 /// Listening sockets are nonblocking on every POSIX backend (zio opens them
 /// so; servers set O_NONBLOCK on inherited ones, as the epoll backend's own
 /// optimistic accept already requires), so this never blocks the executor.
 fn acceptNow(server: Io.net.Socket.Handle, peer_addr: *zio_net.Address, peer_addr_len: *os_net.socklen_t) ?ev.Backend.NetHandle {
-    if (builtin.os.tag == .windows) return null;
-    if (accept_burst >= max_accept_burst) {
-        accept_burst = 0;
-        return null;
-    }
-    _ = runtime_mod.getCurrentExecutorOrNull() orelse return null;
+    if (!zio_options.fast_accept or builtin.os.tag == .windows) return null;
+    const exec = runtime_mod.getCurrentExecutorOrNull() orelse return null;
     const task = runtime_mod.getCurrentTaskOrNull() orelse return null;
+    if (accept_burst >= exec.roundBudget(min_accept_burst)) {
+        accept_burst = 0;
+        // The cancel check below reports a cancel that lands meanwhile.
+        exec.yieldForRound(task);
+    }
     // A pending cancel goes to the loop path, which reports it. Checking
     // consumes it, so it is put back: lost here, the loop path would park
     // on the accept with no cancel left to wake it (a server's drain then
@@ -3584,6 +3591,93 @@ test "io: net TCP accept reports a cancel pending before it, with a connection w
     };
 
     var handle = try rt.spawn(Worker.run, .{rt.io()});
+    try handle.join();
+}
+
+test "io: net TCP accept behind a long run queue takes a waiting backlog in a few passes" {
+    // One executor with two thousand tasks that keep yielding, and fifteen
+    // hundred clients in the listener's backlog. At a fixed 128 accepts a
+    // turn the acceptor would take a dozen passes over the busy tasks to let
+    // them in, the way one serving 25,000 busy connections took many seconds
+    // (each pass ~200 ms) while the clients behind it timed out. With the
+    // budget grown to the length of a pass (`Executor.roundBudget`), two.
+    // Linux only: the backlog has to hold every client (macOS caps it at 128
+    // by default). Pinned only: under work stealing, a task sent to the back
+    // behind two thousand tasks that keep yielding on one executor did not
+    // come back within minutes, with or without this budget (not looked
+    // into further).
+    if (!zio_options.fast_accept or builtin.os.tag != .linux or zio_options.scheduling != .pinned) return error.SkipZigTest;
+    const n_clients = 1500;
+    const n_busy = 2000;
+    {
+        var buf: [32]u8 = undefined;
+        const f = std.c.fopen("/proc/sys/net/core/somaxconn", "r") orelse return error.SkipZigTest;
+        defer _ = std.c.fclose(f);
+        const n = std.c.fread(&buf, 1, buf.len, f);
+        const somaxconn = std.fmt.parseInt(u32, std.mem.trim(u8, buf[0..n], " \n"), 10) catch return error.SkipZigTest;
+        if (somaxconn < n_clients) return error.SkipZigTest;
+    }
+    // Both ends of every connection: raise the soft descriptor limit.
+    {
+        var lim: std.c.rlimit = undefined;
+        if (std.c.getrlimit(.NOFILE, &lim) != 0) return error.SkipZigTest;
+        const want: std.c.rlim_t = 2 * n_clients + 256;
+        if (lim.max < want) return error.SkipZigTest;
+        if (lim.cur < want) {
+            lim.cur = want;
+            if (std.c.setrlimit(.NOFILE, &lim) != 0) return error.SkipZigTest;
+        }
+    }
+
+    const rt = try Runtime.init(std.testing.allocator, .{ .executors = .exact(1) });
+    defer rt.deinit();
+
+    const W = struct {
+        passes: u32 = 0,
+        stop: bool = false,
+
+        fn busy(w: *@This(), first: bool) Io.Cancelable!void {
+            while (!w.stop) {
+                if (first) w.passes += 1;
+                try runtime_mod.yield();
+            }
+        }
+
+        fn run(w: *@This(), io: Io) !void {
+            var server = try Io.net.IpAddress.listen(&.{ .ip4 = .loopback(0) }, io, .{ .reuse_address = true, .kernel_backlog = n_clients + 64 });
+            defer server.deinit(io);
+
+            var clients: [n_clients]Io.net.Stream = undefined;
+            var n_connected: usize = 0;
+            defer for (clients[0..n_connected]) |c| c.close(io);
+            while (n_connected < n_clients) : (n_connected += 1) {
+                clients[n_connected] = try Io.net.IpAddress.connect(&server.socket.address, io, .{ .mode = .stream });
+            }
+
+            var group: Io.Group = .init;
+            defer group.cancel(io);
+            defer w.stop = true;
+            for (0..n_busy) |i| try group.concurrent(io, busy, .{ w, i == 0 });
+            // Behind them all.
+            try runtime_mod.yield();
+
+            var accepted: [n_clients]Io.net.Stream = undefined;
+            var n_accepted: usize = 0;
+            defer for (accepted[0..n_accepted]) |c| c.close(io);
+            const before = w.passes;
+            while (n_accepted < n_clients) : (n_accepted += 1) {
+                accepted[n_accepted] = try server.accept(io);
+            }
+            const passes = w.passes - before;
+            if (passes > 3) {
+                std.debug.print("{d} passes to accept {d} connections\n", .{ passes, n_clients });
+                return error.TestUnexpectedResult;
+            }
+        }
+    };
+
+    var w: W = .{};
+    var handle = try rt.spawn(W.run, .{ &w, rt.io() });
     try handle.join();
 }
 
