@@ -414,6 +414,17 @@ const Self = @This();
 
 const log = @import("../../common.zig").log;
 
+/// A socket operation refused at submission. What the peer or the network
+/// did (a reset, an abort, an unreachable host) is the operation's result,
+/// returned to the caller like any other, and logged at debug only, as on
+/// the other backends; anything else is logged at err.
+fn logSubmitError(comptime what: []const u8, err: windows.WinsockError) void {
+    switch (err) {
+        .ECONNRESET, .ECONNABORTED, .ECONNREFUSED, .ENETRESET, .ENETDOWN, .ENETUNREACH, .EHOSTUNREACH, .ENOTCONN, .ESHUTDOWN, .ETIMEDOUT, .EDISCON => log.debug(what ++ " failed: {}", .{err}),
+        else => log.err(what ++ " failed: {}", .{err}),
+    }
+}
+
 allocator: std.mem.Allocator,
 shared_state: *SharedState,
 entries: []windows.OVERLAPPED_ENTRY,
@@ -958,7 +969,7 @@ fn submitPoll(self: *Self, state: *LoopState, data: *NetPoll) !void {
         }
         if (err != .IO_PENDING) {
             // Real error - complete immediately with error
-            log.err("WSARecv/WSASend (poll) failed: {}", .{err});
+            logSubmitError("WSARecv/WSASend (poll)", err);
             data.c.setError(net.errnoToRecvError(err));
             state.markCompletedFromBackend(&data.c);
             return;
@@ -1008,7 +1019,7 @@ fn submitRecv(self: *Self, state: *LoopState, data: *NetRecv) !void {
         // failed submission, so its completion packet still follows.
         if (err != .IO_PENDING and err != .EMSGSIZE) {
             // Real error - complete immediately with error
-            log.err("WSARecv failed: {}", .{err});
+            logSubmitError("WSARecv", err);
             data.c.setError(net.errnoToRecvError(err));
             state.markCompletedFromBackend(&data.c);
             return;
@@ -1044,7 +1055,7 @@ fn submitSend(self: *Self, state: *LoopState, data: *NetSend) !void {
         const err = windows.WSAGetLastError();
         if (err != .IO_PENDING) {
             // Real error - complete immediately with error
-            log.err("WSASend failed: {}", .{err});
+            logSubmitError("WSASend", err);
             data.c.setError(net.errnoToSendError(err));
             state.markCompletedFromBackend(&data.c);
             return;
@@ -1096,7 +1107,7 @@ fn submitRecvFrom(self: *Self, state: *LoopState, data: *NetRecvFrom) !void {
         // failed submission, so its completion packet still follows.
         if (err != .IO_PENDING and err != .EMSGSIZE) {
             // Real error - complete immediately with error
-            log.err("WSARecvFrom failed: {}", .{err});
+            logSubmitError("WSARecvFrom", err);
             data.c.setError(net.errnoToRecvError(err));
             state.markCompletedFromBackend(&data.c);
             return;
@@ -1134,7 +1145,7 @@ fn submitSendTo(self: *Self, state: *LoopState, data: *NetSendTo) !void {
         const err = windows.WSAGetLastError();
         if (err != .IO_PENDING) {
             // Real error - complete immediately with error
-            log.err("WSASendTo failed: {}", .{err});
+            logSubmitError("WSASendTo", err);
             data.c.setError(net.errnoToSendError(err));
             state.markCompletedFromBackend(&data.c);
             return;
@@ -1205,7 +1216,7 @@ fn submitRecvMsg(self: *Self, state: *LoopState, data: *NetRecvMsg) !void {
         // WSAEMSGSIZE is a truncated datagram that was delivered, not a
         // failed submission, so its completion packet still follows.
         if (err != .IO_PENDING and err != .EMSGSIZE) {
-            log.err("WSARecvMsg failed: {}", .{err});
+            logSubmitError("WSARecvMsg", err);
             data.c.setError(net.errnoToRecvError(err));
             state.markCompletedFromBackend(&data.c);
             return;
@@ -1256,7 +1267,7 @@ fn submitSendMsg(self: *Self, state: *LoopState, data: *NetSendMsg) !void {
     if (result == windows.SOCKET_ERROR) {
         const err = windows.WSAGetLastError();
         if (err != .IO_PENDING) {
-            log.err("WSASendMsg failed: {}", .{err});
+            logSubmitError("WSASendMsg", err);
             data.c.setError(net.errnoToSendError(err));
             state.markCompletedFromBackend(&data.c);
             return;
@@ -1327,7 +1338,7 @@ fn armNetSendFile(self: *Self, data: *NetSendFile) !bool {
     if (result == windows.FALSE) {
         const err = windows.WSAGetLastError();
         if (err != .IO_PENDING) {
-            log.err("TransmitFile failed: {}", .{err});
+            logSubmitError("TransmitFile", err);
             return net.errnoToSendError(err);
         }
     }
@@ -1399,7 +1410,7 @@ fn submitConnect(self: *Self, state: *LoopState, data: *NetConnect) !void {
         const err = windows.WSAGetLastError();
         if (err != .IO_PENDING) {
             // Real error - complete immediately with error
-            log.err("ConnectEx failed: {}", .{err});
+            logSubmitError("ConnectEx", err);
             data.c.setError(net.errnoToConnectError(err));
             state.markCompletedFromBackend(&data.c);
             return;
