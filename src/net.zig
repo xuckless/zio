@@ -3501,6 +3501,54 @@ test "Socket: receiveFromBatch keeps the first message when a later slot fails" 
     try std.testing.expectEqualStrings("aaa", messages[0].buf[0..messages[0].len]);
 }
 
+test "Socket: a send flag the socket doesn't support fails" {
+    // Only Linux rejects MSG_OOB on UDP; FreeBSD and Wine send the datagram
+    // anyway, and macOS fails with an errno zio doesn't map.
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+
+    const runtime = try Runtime.init(std.testing.allocator, .{});
+    defer runtime.deinit();
+
+    const addr = try IpAddress.parseIp4("127.0.0.1", 0);
+    var sender = try addr.bind(.{});
+    defer sender.close();
+    var receiver = try addr.bind(.{});
+    defer receiver.close();
+
+    // UDP has no out-of-band data, so the flag has to reach the kernel for
+    // this to fail.
+    var iov = [_]os.iovec_const{os.net.iovecConstFromSlice("x")};
+    var op = ev.NetSendMsg.init(sender.handle, .{ .iovecs = &iov }, .{ .oob = true }, &receiver.address.any, getSockAddrLen(&receiver.address.any), null);
+    try waitForIo(&op.c);
+    try std.testing.expectError(error.OperationNotSupported, op.getResult());
+}
+
+test "Socket: a UDP receive is not failed by an ICMP error for an earlier datagram" {
+    // Windows fails the next receive with WSAECONNRESET once an ICMP port
+    // unreachable comes back for a datagram sent to a closed port, unless
+    // SIO_UDP_CONNRESET is off. POSIX systems never report it on an
+    // unconnected socket.
+    const runtime = try Runtime.init(std.testing.allocator, .{});
+    defer runtime.deinit();
+
+    const addr = try IpAddress.parseIp4("127.0.0.1", 0);
+    var socket = try addr.bind(.{});
+    defer socket.close();
+    var peer = try addr.bind(.{});
+    defer peer.close();
+
+    var gone = try addr.bind(.{});
+    const gone_address = gone.address;
+    gone.close();
+
+    _ = try socket.sendTo(gone_address, "lost", .none);
+    _ = try peer.sendTo(socket.address, "hello", .none);
+
+    var buf: [64]u8 = undefined;
+    const result = try socket.receiveFrom(&buf, .{ .duration = .fromSeconds(1) });
+    try std.testing.expectEqualStrings("hello", buf[0..result.len]);
+}
+
 test "Socket: receiveFromBatch drains multiple queued datagrams" {
     const runtime = try Runtime.init(std.testing.allocator, .{});
     defer runtime.deinit();

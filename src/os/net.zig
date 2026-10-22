@@ -1184,6 +1184,12 @@ pub const SendFlags = packed struct {
     eor: bool = false,
     oob: bool = false,
     fastopen: bool = false,
+    /// Fail with `error.WouldBlock` instead of blocking in the send syscall
+    /// when the socket can't take the data. On POSIX this is MSG_DONTWAIT and
+    /// holds regardless of the socket's blocking mode. Windows has no such
+    /// flag, so there it relies on the socket being in FIONBIO mode. It does
+    /// not stop an operation from waiting for the socket to become writable.
+    dontwait: bool = false,
 };
 
 fn sendFlagsToSys(flags: SendFlags) c_int {
@@ -1195,6 +1201,7 @@ fn sendFlagsToSys(flags: SendFlags) c_int {
     if (flags.eor and @hasDecl(MSG, "EOR")) sys_flags |= MSG.EOR;
     if (flags.oob and @hasDecl(MSG, "OOB")) sys_flags |= MSG.OOB;
     if (flags.fastopen and @hasDecl(MSG, "FASTOPEN")) sys_flags |= MSG.FASTOPEN;
+    if (flags.dontwait and @hasDecl(MSG, "DONTWAIT")) sys_flags |= MSG.DONTWAIT;
     return sys_flags;
 }
 
@@ -1553,7 +1560,20 @@ pub const has_recvmmsg = switch (builtin.os.tag) {
     else => false,
 };
 
-pub const mmsghdr = if (has_recvmmsg) posix.system.mmsghdr else struct {};
+pub const has_sendmmsg = switch (builtin.os.tag) {
+    .linux, .freebsd, .netbsd => true,
+    else => false,
+};
+
+pub const mmsghdr = switch (builtin.os.tag) {
+    .linux, .netbsd => posix.system.mmsghdr,
+    // msg_len is ssize_t on FreeBSD; std.c declares it as u32.
+    .freebsd => extern struct {
+        hdr: posix.system.msghdr,
+        len: isize,
+    },
+    else => struct {},
+};
 
 pub fn recvmmsg(
     fd: fd_t,
@@ -1586,34 +1606,52 @@ pub fn recvmmsg(
 
 fn recvmmsg_syscall(fd: fd_t, msgvec: [*]mmsghdr, vlen: u32, flags: c_int) switch (builtin.os.tag) {
     .linux => usize,
+    .freebsd => isize,
     else => c_int,
 } {
     switch (builtin.os.tag) {
         .linux => return posix.system.recvmmsg(fd, msgvec, vlen, @intCast(flags), null),
-        .freebsd, .netbsd => return recvmmsg_libc(fd, msgvec, vlen, flags, null),
+        .freebsd, .netbsd => return mmsg_libc.recvmmsg(fd, msgvec, vlen, @bitCast(flags), null),
         else => unreachable,
     }
 }
 
-const recvmmsg_libc = if (builtin.os.tag == .freebsd or builtin.os.tag == .netbsd)
-    struct {
-        extern "c" fn recvmmsg(sockfd: fd_t, msgvec: [*]mmsghdr, vlen: c_uint, flags: c_int, timeout: ?*posix.system.timespec) c_int;
-    }.recvmmsg
-else
-    void;
+fn sendmmsg_syscall(fd: fd_t, msgvec: [*]mmsghdr, vlen: u32, flags: c_int) switch (builtin.os.tag) {
+    .linux => usize,
+    .freebsd => isize,
+    else => c_int,
+} {
+    switch (builtin.os.tag) {
+        .linux => return posix.system.sendmmsg(fd, msgvec, vlen, @intCast(flags)),
+        .freebsd, .netbsd => return mmsg_libc.sendmmsg(fd, msgvec, vlen, @bitCast(flags)),
+        else => unreachable,
+    }
+}
 
-/// `sendmmsg`: several datagrams in one system call (Linux).
-pub const has_sendmmsg = builtin.os.tag == .linux;
+/// As each libc declares them in sys/socket.h.
+const mmsg_libc = switch (builtin.os.tag) {
+    .freebsd => struct {
+        extern "c" fn recvmmsg(sockfd: fd_t, msgvec: [*]mmsghdr, vlen: usize, flags: c_int, timeout: ?*const posix.system.timespec) isize;
+        extern "c" fn sendmmsg(sockfd: fd_t, msgvec: [*]mmsghdr, vlen: usize, flags: c_int) isize;
+    },
+    .netbsd => struct {
+        extern "c" fn recvmmsg(sockfd: fd_t, msgvec: [*]mmsghdr, vlen: c_uint, flags: c_uint, timeout: ?*posix.system.timespec) c_int;
+        extern "c" fn sendmmsg(sockfd: fd_t, msgvec: [*]mmsghdr, vlen: c_uint, flags: c_uint) c_int;
+    },
+    else => struct {},
+};
 
-/// Sends the messages in `msgvec` with one `sendmmsg` that never waits:
-/// returns how many the kernel took, which is fewer than `vlen` when the
-/// next would block or fail (the following call reports that one), and
-/// `error.WouldBlock` when it took none. Each message's `len` is set to the
-/// bytes sent.
-pub fn sendmmsg(fd: fd_t, msgvec: [*]mmsghdr, vlen: u32, flags: SendFlags) SendError!u32 {
-    const sys_flags = sendFlagsToSys(flags) | posix.system.MSG.DONTWAIT;
+pub fn sendmmsg(
+    fd: fd_t,
+    msgvec: [*]mmsghdr,
+    vlen: u32,
+    flags: SendFlags,
+) SendError!u32 {
+    const sys_flags = sendFlagsToSys(flags);
+
     while (true) {
-        const rc = posix.system.sendmmsg(fd, msgvec, vlen, @intCast(sys_flags));
+        const rc = sendmmsg_syscall(fd, msgvec, vlen, sys_flags);
+
         switch (posix.errno(rc)) {
             .SUCCESS => return @intCast(rc),
             .INTR => continue,

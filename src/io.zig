@@ -2577,9 +2577,10 @@ fn zioSendFlags(flags: Io.net.SendFlags) os_net.SendFlags {
     };
 }
 
-/// Sends each message in turn, reporting how many made it. A partial count is
-/// part of the contract, so a caller that gets fewer than it passed re-submits
-/// the rest; that is what lets the batch path below send just one.
+/// Sends the messages in batches, reporting how many made it. A partial count
+/// is part of the contract, so a caller that gets fewer than it passed
+/// re-submits the rest; that is what lets the batch path below send just one,
+/// and how this loop continues after a batch that came back short.
 fn netSendOpImpl(
     handle: Io.net.Socket.Handle,
     messages: []Io.net.OutgoingMessage,
@@ -2588,75 +2589,40 @@ fn netSendOpImpl(
     clock: time.Clock,
 ) (Io.Cancelable || common.Timeoutable)!Io.Operation.NetSend.Result {
     const zio_flags = zioSendFlags(flags);
+    const deadline = timeout.toDeadlineOn(clock);
+    var addrs: [max_mmsg_slots]zio_net.IpAddress = undefined;
+    var slots: [max_mmsg_slots]ev.NetSendMmsg.Slot = undefined;
 
-    // Several datagrams: as many as the kernel takes at once in one
-    // `sendmmsg`, the rest (if a socket buffer filled) one by one below,
-    // waiting for room.
-    var start: usize = 0;
-    if (os_net.has_sendmmsg and messages.len > 1) {
-        const r = @call(.never_inline, netSendMmsg, .{ handle, messages, zio_flags });
-        if (r.err) |err| return .{ sendErrToSocketSendErr(err), r.sent };
-        start = r.sent;
-    }
-
-    for (messages[start..], start..) |*msg, i| {
-        const zio_addr = stdIoIpToZio(msg.address.*);
-        const iovec = os_net.iovecConstFromSlice(msg.data_ptr[0..msg.data_len]);
-
-        var op = ev.NetSendMsg.init(
-            stdIoHandleToZio(handle),
-            .{ .iovecs = (&iovec)[0..1] },
-            zio_flags,
-            &zio_addr.any,
-            sockAddrLen(&zio_addr.any),
-            if (msg.control.len != 0) msg.control else null,
-        );
-        try timedWaitForIoClock(&op.c, timeout, clock);
-        const sent = op.getResult() catch |err| return .{ sendErrToSocketSendErr(err), i };
-        msg.data_len = sent;
-    }
-    return .{ null, messages.len };
-}
-
-const max_send_mmsg = 32;
-
-/// Sends from the front of `messages` with non-blocking `sendmmsg` calls
-/// until all have gone or the socket would block; returns how many went.
-fn netSendMmsg(
-    handle: Io.net.Socket.Handle,
-    messages: []Io.net.OutgoingMessage,
-    flags: os_net.SendFlags,
-) struct { sent: usize, err: ?os_net.SendError } {
-    var sent: usize = 0;
-    var addrs: [max_send_mmsg]zio_net.IpAddress = undefined;
-    var iovecs: [max_send_mmsg]os_net.iovec_const = undefined;
-    var msgvec: [max_send_mmsg]os_net.mmsghdr = undefined;
-    while (sent < messages.len) {
-        const batch = messages[sent..][0..@min(messages.len - sent, max_send_mmsg)];
-        for (batch, 0..) |*msg, i| {
-            addrs[i] = stdIoIpToZio(msg.address.*);
-            iovecs[i] = os_net.iovecConstFromSlice(msg.data_ptr[0..msg.data_len]);
-            msgvec[i] = .{
-                .hdr = .{
-                    .name = @ptrCast(&addrs[i].any),
-                    .namelen = sockAddrLen(&addrs[i].any),
-                    .iov = @ptrCast(&iovecs[i]),
-                    .iovlen = 1,
-                    .control = if (msg.control.len != 0) @constCast(msg.control.ptr) else null,
-                    .controllen = msg.control.len,
-                    .flags = 0,
-                },
-                .len = 0,
+    var i: usize = 0;
+    while (i < messages.len) {
+        const batch = messages[i..][0..@min(messages.len - i, max_mmsg_slots)];
+        for (batch, addrs[0..batch.len], slots[0..batch.len]) |msg, *addr, *slot| {
+            addr.* = stdIoIpToZio(msg.address.*);
+            slot.* = .{
+                .data = msg.data_ptr[0..msg.data_len],
+                .addr = &addr.any,
+                .addr_len = sockAddrLen(&addr.any),
+                .control = if (msg.control.len != 0) msg.control else null,
             };
         }
-        const n = os_net.sendmmsg(stdIoHandleToZio(handle), &msgvec, @intCast(batch.len), flags) catch |err| switch (err) {
-            error.WouldBlock => return .{ .sent = sent, .err = null },
-            else => |e| return .{ .sent = sent, .err = e },
+
+        var op = ev.NetSendMmsg.init(stdIoHandleToZio(handle), slots[0..batch.len], zio_flags);
+        timedWaitForIoClock(&op.c, deadline, clock) catch |err| {
+            // A failed wait means this batch sent nothing, but the earlier
+            // ones can't be taken back, so the caller gets their count, and a
+            // cancellation is left for its next cancellation point.
+            if (i == 0) return err;
+            switch (err) {
+                error.Canceled => runtime_mod.recancel(),
+                error.Timeout => {},
+            }
+            return .{ null, i };
         };
-        for (batch[0..n], msgvec[0..n]) |*msg, m| msg.data_len = m.len;
-        sent += n;
+        const sent = op.getResult() catch |err| return .{ sendErrToSocketSendErr(err), i };
+        for (batch[0..sent], slots[0..sent]) |*msg, slot| msg.data_len = slot.sent_len;
+        i += sent;
     }
-    return .{ .sent = sent, .err = null };
+    return .{ null, messages.len };
 }
 
 fn netReadOpImpl(
@@ -4036,6 +4002,116 @@ test "io: net UDP sendMany delivers multiple datagrams" {
     for (&messages, payloads) |m, p| {
         try std.testing.expectEqual(p.len, m.data_len);
     }
+}
+
+test "io: net UDP sendMany delivers more datagrams than one batch, each to its own address" {
+    const rt = try Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+    const io = rt.io();
+
+    var sender = try Io.net.IpAddress.bind(&.{ .ip4 = .loopback(0) }, io, .{ .mode = .dgram });
+    defer sender.close(io);
+
+    var receivers: [2]Io.net.Socket = undefined;
+    for (&receivers) |*r| r.* = try Io.net.IpAddress.bind(&.{ .ip4 = .loopback(0) }, io, .{ .mode = .dgram });
+    defer for (&receivers) |*r| r.close(io);
+
+    const count = 150;
+    var payloads: [count][4]u8 = undefined;
+    var messages: [count]Io.net.OutgoingMessage = undefined;
+    for (&messages, &payloads, 0..) |*m, *p, i| {
+        std.mem.writeInt(u32, p, @intCast(i), .little);
+        m.* = .{ .address = &receivers[i % 2].address, .data_ptr = p, .data_len = p.len };
+    }
+
+    try sender.sendMany(io, &messages, .{});
+
+    for (messages) |m| {
+        try std.testing.expectEqual(4, m.data_len);
+    }
+
+    var buf: [16]u8 = undefined;
+    for (0..count) |i| {
+        const msg = try receivers[i % 2].receive(io, &buf);
+        try std.testing.expectEqual(4, msg.data.len);
+        try std.testing.expectEqual(i, std.mem.readInt(u32, msg.data[0..4], .little));
+    }
+}
+
+test "io: net UDP sendMany reports an error in the middle of a batch with the count sent before it" {
+    // IOCP completes a send that fails with WSAEMSGSIZE right away, but a
+    // completion packet still follows for it.
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const rt = try Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+    const io = rt.io();
+
+    var sender = try Io.net.IpAddress.bind(&.{ .ip4 = .loopback(0) }, io, .{ .mode = .dgram });
+    defer sender.close(io);
+
+    var receiver = try Io.net.IpAddress.bind(&.{ .ip4 = .loopback(0) }, io, .{ .mode = .dgram });
+    defer receiver.close(io);
+
+    // Larger than any IPv4 UDP datagram, so this one fails with EMSGSIZE.
+    const bad = 70;
+    var oversized: [70000]u8 = undefined;
+    @memset(&oversized, 0);
+
+    const count = 150;
+    var payloads: [count][4]u8 = undefined;
+    var messages: [count]Io.net.OutgoingMessage = undefined;
+    for (&messages, &payloads, 0..) |*m, *p, i| {
+        std.mem.writeInt(u32, p, @intCast(i), .little);
+        m.* = .{ .address = &receiver.address, .data_ptr = p, .data_len = p.len };
+    }
+    messages[bad] = .{ .address = &receiver.address, .data_ptr = &oversized, .data_len = oversized.len };
+
+    const err, const sent = sender.sendManyTimeout(io, &messages, .{}, .none);
+    try std.testing.expectEqual(error.MessageOversize, err.?);
+    try std.testing.expectEqual(bad, sent);
+
+    var buf: [16]u8 = undefined;
+    for (0..bad) |i| {
+        try std.testing.expectEqual(4, messages[i].data_len);
+        const msg = try receiver.receive(io, &buf);
+        try std.testing.expectEqual(4, msg.data.len);
+        try std.testing.expectEqual(i, std.mem.readInt(u32, msg.data[0..4], .little));
+    }
+}
+
+test "io: net sendManyTimeout reports the count sent before a timeout" {
+    // WSASendMsg only takes datagram sockets, and a datagram send never waits.
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const rt = try Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+    const io = rt.io();
+
+    // A stream socket whose peer never reads, so the send buffer fills up
+    // after the first batches and the rest waits until the timeout.
+    const address: Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var server = try address.listen(io, .{});
+    defer server.deinit(io);
+    const client = try server.socket.address.connect(io, .{ .mode = .stream });
+    defer client.close(io);
+    const conn = try server.accept(io);
+    defer conn.close(io);
+
+    var chunk: [64 * 1024]u8 = undefined;
+    @memset(&chunk, 0);
+    var messages: [1000]Io.net.OutgoingMessage = undefined;
+    for (&messages) |*m| {
+        m.* = .{ .address = &server.socket.address, .data_ptr = &chunk, .data_len = chunk.len };
+    }
+
+    const err, const sent = client.socket.sendManyTimeout(io, &messages, .{}, .{ .duration = .{
+        .raw = .fromMilliseconds(100),
+        .clock = .awake,
+    } });
+    try std.testing.expectEqual(null, err);
+    try std.testing.expect(sent > 0);
+    try std.testing.expect(sent < messages.len);
 }
 
 test "io: netLookup resolves numeric IPv4" {

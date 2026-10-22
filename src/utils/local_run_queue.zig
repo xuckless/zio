@@ -10,8 +10,9 @@
 //! FIFO order avoids the LIFO "a yielder jumps ahead of ready tasks" unfairness a
 //! stack has.
 //!
-//! When the ring is full, half of it plus the new task spill to the overflow
-//! queue (Go's `runqputslow` → global queue), which also takes cross-thread wakes:
+//! When the ring is full, the new task spills to the overflow queue, along with
+//! half the ring when stealable (Go's `runqputslow` → global queue). The overflow
+//! queue also takes cross-thread wakes:
 //!   * stealable     -> a `GlobalOverflowQueue` shared by the whole runtime and
 //!                      drained by every executor (load-balanced across all).
 //!   * non-stealable -> a `LocalOverflowQueue` embedded in the ring, drained only
@@ -245,22 +246,12 @@ pub fn LocalRunQueue(comptime T: type, comptime stealable: bool) type {
         }
 
         /// Owner-only push (FIFO, to the tail). On a full ring, spills half the
-        /// ring plus this node to the overflow queue (Go's runqput/runqputslow).
+        /// ring plus this node to the overflow queue (Go's runqput/runqputslow),
+        /// so other executors can pick that work up. Without stealers the
+        /// spill would only move the oldest tasks behind newer ones, so a
+        /// non-stealable ring spills just this node.
         /// Returns true when the ring was empty before the push.
-        ///
-        /// Without stealers (pinned scheduling) the spill would only reorder
-        /// work: the oldest half of the ring would go behind tasks woken after
-        /// it, and with the busy ring taking back one overflow task per check
-        /// it could wait ~half a ring's worth of ticks (with 256+ busy
-        /// connections on one executor, a ~13 ms p99 where the mean is 1 ms).
-        /// So the ring and its overflow stay one FIFO queue: once anything is
-        /// in the overflow, new tasks queue behind it, and a full ring spills
-        /// only the new task.
         pub fn push(self: *Self, node: *T) bool {
-            if (!stealable and !self.overflow.isEmpty()) {
-                self.overflow.push(node);
-                return false;
-            }
             while (true) {
                 const h = self.loadHead(); // synchronize with consumers
                 const t = self.ownTail(); // owner is the sole producer
@@ -375,6 +366,32 @@ pub fn LocalRunQueue(comptime T: type, comptime stealable: bool) type {
             const got = self.overflow.popBatch(self.buffer[start .. start + want], lock_mode);
             if (got > 0) self.storeTail(t +% @as(u32, @intCast(got)));
             return got;
+        }
+
+        /// Move overflow tasks into the ring until it is full or the overflow is
+        /// empty, returning how many moved. Non-stealable only: the private
+        /// overflow queue has no lock to bound the hold time of, and only the
+        /// owner touches the cursors, so an empty ring restarts at slot 0 and
+        /// takes one contiguous run; otherwise the copy continues past the wrap.
+        pub fn fillFromOverflow(self: *Self) usize {
+            if (stealable) @compileError("fillFromOverflow() is for non-stealable queues; a shared overflow queue is drained with refill()");
+            if (self.head == self.tail) {
+                self.head = 0;
+                self.tail = 0;
+            }
+            var moved: usize = 0;
+            while (true) {
+                const t = self.tail;
+                const space: usize = capacity - (t -% self.head);
+                const start: usize = t & mask;
+                const want = @min(capacity - start, space);
+                if (want == 0) break;
+                const got = self.overflow.popBatch(self.buffer[start .. start + want], .try_only);
+                self.tail = t +% @as(u32, @intCast(got));
+                moved += got;
+                if (got < want) break;
+            }
+            return moved;
         }
 
         /// Number of tasks currently in the ring (used for maybeYield fairness).
@@ -842,7 +859,7 @@ test "LocalOverflowQueue: pushes and batches drain in FIFO order" {
     try testing.expectEqual(0, ov.popBatch(&rest, .block));
 }
 
-test "LocalRunQueue: non-stealable spill and refill keep FIFO order" {
+test "LocalRunQueue: non-stealable spill and fill keep FIFO order" {
     const cap = TestLocalQueue.capacity;
     const total = cap + cap / 2;
     var q: TestLocalQueue = .{};
@@ -860,37 +877,47 @@ test "LocalRunQueue: non-stealable spill and refill keep FIFO order" {
     defer order.deinit(testing.allocator);
     while (true) {
         while (q.pop()) |n| try order.append(testing.allocator, n.id);
-        if (q.refill(std.math.maxInt(usize), .block) == 0) break;
+        if (q.fillFromOverflow() == 0) break;
     }
 
-    // With no stealers the ring and its overflow are one FIFO queue.
+    // The ring drains first, then the overflow, so the order is FIFO.
     try testing.expectEqual(total, order.items.len);
     try testing.expect(q.overflow.isEmpty());
     for (order.items, 0..) |id, i| try testing.expectEqual(i, id);
 }
 
-test "LocalRunQueue: non-stealable push queues behind a non-empty overflow" {
+test "LocalRunQueue: fillFromOverflow fills all free space" {
     const cap = TestLocalQueue.capacity;
     var q: TestLocalQueue = .{};
 
-    const nodes = try testing.allocator.alloc(TestNode, cap + 2);
+    const nodes = try testing.allocator.alloc(TestNode, cap);
     defer testing.allocator.free(nodes);
-    for (nodes[0 .. cap + 1], 0..) |*n, i| {
-        n.* = .{ .id = i };
-        _ = q.push(n);
-    }
-    // Room in the ring again, but task `cap` still waits in the overflow:
-    // the next push must not overtake it.
-    try testing.expectEqual(0, q.pop().?.id);
-    nodes[cap + 1] = .{ .id = cap + 1 };
-    try testing.expect(!q.push(&nodes[cap + 1]));
+    for (nodes, 0..) |*n, i| n.* = .{ .id = i };
 
-    var expect: usize = 1;
-    while (true) {
-        while (q.pop()) |n| : (expect += 1) try testing.expectEqual(expect, n.id);
-        if (q.refill(std.math.maxInt(usize), .block) == 0) break;
+    // Leave the cursors just short of the wrap point with the ring empty.
+    for (nodes[0 .. cap - 6]) |*n| {
+        _ = q.push(n);
+        _ = q.pop();
     }
-    try testing.expectEqual(cap + 2, expect);
+
+    // An empty ring takes a whole ring's worth in one call.
+    for (nodes) |*n| q.overflow.push(n);
+    try testing.expectEqual(cap, q.fillFromOverflow());
+    var expect: usize = 0;
+    while (q.pop()) |n| : (expect += 1) try testing.expectEqual(expect, n.id);
+    try testing.expectEqual(cap, expect);
+
+    // A non-empty ring ending short of the wrap point fills past it.
+    for (nodes[0 .. cap - 6]) |*n| {
+        _ = q.push(n);
+        _ = q.pop();
+    }
+    for (nodes[0..2]) |*n| _ = q.push(n);
+    for (nodes[2..100]) |*n| q.overflow.push(n);
+    try testing.expectEqual(98, q.fillFromOverflow());
+    expect = 0;
+    while (q.pop()) |n| : (expect += 1) try testing.expectEqual(expect, n.id);
+    try testing.expectEqual(100, expect);
 }
 
 test "LocalOverflowQueue: concurrent producers lose, duplicate or reorder no task" {

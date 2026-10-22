@@ -1111,23 +1111,24 @@ pub const Executor = struct {
         // Refill from the overflow queue before draining the dispatched queue:
         // overflow tasks became runnable earlier, and a busy ring has room only
         // in the slots this pass freed, which a steady completion stream would
-        // fill on every pass. A busy ring takes one task per check, which bounds
-        // an overflow task's wait; this executor is often its only consumer, as
-        // stealing takes from rings and armSearcher does nothing while nobody is
-        // idle. An empty ring takes a batch. Overflow work counts as work, so a
-        // local ring spill (which doesn't wake the loop) can't put this executor
-        // to sleep.
+        // fill on every pass. Overflow work counts as work, so a local ring
+        // spill (which doesn't wake the loop) can't put this executor to sleep.
         if (!self.run_queue.overflow.isEmpty()) {
-            if (self.run_queue.isEmpty()) {
-                _ = self.run_queue.refill(self.overflowBatch(), .block);
-            } else if (migrates) {
-                _ = self.run_queue.refill(1, .try_only);
+            if (migrates) {
+                // The shared queue: a busy ring takes one task per check, which
+                // bounds an overflow task's wait while leaving the rest to the
+                // other executors; this executor is often its only consumer, as
+                // stealing takes from rings and armSearcher does nothing while
+                // nobody is idle. An empty ring takes a batch.
+                if (self.run_queue.isEmpty()) {
+                    _ = self.run_queue.refill(self.overflowBatch(), .block);
+                } else {
+                    _ = self.run_queue.refill(1, .try_only);
+                }
             } else {
-                // A private overflow holds only tasks queued behind the ring
-                // (see LocalRunQueue.push), so it refills as far as the ring
-                // has room: one at a time would leave its tasks waiting a
-                // tick each.
-                _ = self.run_queue.refill(std.math.maxInt(usize), .try_only);
+                // This executor's own queue, which nobody else drains: take
+                // as many as the ring has room for.
+                _ = self.run_queue.fillFromOverflow();
             }
         }
         // Task wakes can enter the dispatched queue outside any poll: an
@@ -1235,7 +1236,7 @@ pub const Executor = struct {
             // Pinned: the ring ran dry within the tick while tasks wait in
             // its overflow; take them now rather than after a poll.
             if (migrates or self.run_queue.overflow.isEmpty()) return null;
-            if (self.run_queue.refill(std.math.maxInt(usize), .try_only) == 0) return null;
+            if (self.run_queue.fillFromOverflow() == 0) return null;
             break :blk self.run_queue.pop() orelse return null;
         };
         self.spendQuantum();
@@ -1436,7 +1437,7 @@ pub const Executor = struct {
                 self.pending_cleanup = .none;
                 task.state.store(.{ .tag = .finished }, .release);
                 task.releaseCoroLocal(self);
-                finishTask(self.runtime, &task.awaitable);
+                finishTask(&task.awaitable);
             },
         }
     }
@@ -1498,27 +1499,42 @@ pub fn getWaitableTaskOrNull() ?*AnyTask {
     return exec.current_task;
 }
 
-/// Whether the calling thread is runtime machinery rather than user code.
-/// Only thread-pool workers set it, once, for their whole life.
-threadlocal var machinery_thread: bool = false;
+/// What the calling thread is running, for code that has to decide whether it
+/// may suspend.
+pub const ThreadRole = enum {
+    /// User code: a task, or a thread running user code. May park.
+    user,
+    /// Runtime machinery: a thread-pool worker. A parked task may be waiting
+    /// on this very thread, so it must never wait for a task -- including
+    /// while it runs `spawnBlocking` user code, which would otherwise be able
+    /// to starve the worker needed to release the lock.
+    machinery,
+};
 
-/// Mark the calling thread as runtime machinery for the rest of its life.
+/// The role of the calling thread. A thread is `user` until it declares
+/// otherwise, so the default needs no setup and cannot be inherited by
+/// accident.
+threadlocal var thread_role: ThreadRole = .user;
+
+/// Set the calling thread's role for the rest of its life.
 ///
 /// **Internal to the runtime, and not exported from `zio`.** A thread-pool
-/// worker runs the scheduler's own work: a delegated operation, and then the
-/// completion that hands its result to the task parked on it. That task can
-/// hold the stderr lock while it waits, so a log call on the worker must not
-/// block on it -- `stderr.currentContext` classifies a machinery thread as
-/// no-suspend, diverting it to the scheduler sink instead.
+/// worker declares itself machinery when it starts, and that covers the
+/// `spawnBlocking` user code it also runs: such code can block on the stderr
+/// lock, and the task holding that lock may be parked on this very pool, so
+/// waiting would starve the worker needed to release it.
 ///
-/// Called once per worker, from `ThreadPool.run`.
-pub fn markMachineryThread() void {
-    machinery_thread = true;
+/// The stderr lock reads the role through `currentContext`, which classifies
+/// machinery as no-suspend and diverts it to the scheduler sink rather than
+/// waiting. Any other wait a task can hold across a suspension has to consult
+/// the role the same way: machinery must never wait for a task.
+pub fn setThreadRole(role: ThreadRole) void {
+    thread_role = role;
 }
 
-/// Whether the calling thread was marked by `markMachineryThread`.
-pub fn isMachineryThread() bool {
-    return machinery_thread;
+/// The calling thread's role; see `ThreadRole`.
+pub fn getThreadRole() ThreadRole {
+    return thread_role;
 }
 
 /// Enter a no-suspend region on this thread.
@@ -1712,7 +1728,6 @@ pub const Runtime = struct {
     main_executor: Executor,
     next_executor_index: std.atomic.Value(usize) = .init(0),
     workers: std.ArrayList(Worker) = .empty,
-    task_count: std.atomic.Value(u32) = std.atomic.Value(u32).init(0), // Active task counter
     shutting_down: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     // Worker lifecycle barriers, see runWorker(). A worker starts running
     // only once worker_start is .run, after every executor is registered, so
@@ -1952,8 +1967,9 @@ pub const Runtime = struct {
         // Stop worker executors and join threads (deinits their loops)
         self.shutdownWorkers();
 
-        // All tasks should be complete before deinit
-        std.debug.assert(self.task_count.load(.acquire) == 0);
+        // All tasks should be complete before deinit. A task holds its stack
+        // until it finishes, so the pool's count of stacks in use covers them.
+        std.debug.assert(self.stack_pool.in_use == 0);
 
         // Clean up ThreadPool (worker threads already joined by stop()).
         self.thread_pool.deinit();
@@ -2346,6 +2362,28 @@ test "runtime: spawnBlocking smoke test" {
 
     const result = handle.join();
     try std.testing.expectEqual(42, result);
+}
+
+test "runtime: spawnBlocking runs on a machinery thread" {
+    const runtime = try Runtime.init(std.testing.allocator, .{ .thread_pool = .{} });
+    defer runtime.deinit();
+
+    const Probe = struct {
+        fn call(out: *ThreadRole) ThreadRole {
+            out.* = getThreadRole();
+            return out.*;
+        }
+    };
+
+    var observed: ThreadRole = .user;
+    var handle = try runtime.spawnBlocking(Probe.call, .{&observed});
+    defer handle.cancel();
+
+    _ = handle.join();
+    // Deliberately machinery although `call` is user code: if it waited for a
+    // task-held stderr lock, the task parked on this pool could never be
+    // resumed to release it.
+    try std.testing.expectEqual(ThreadRole.machinery, observed);
 }
 
 test "runtime: spawnBlocking cancel interrupts a blocking syscall on the worker" {
