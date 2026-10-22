@@ -1961,6 +1961,10 @@ pub const Runtime = struct {
         // Stop worker executors and join threads (deinits their loops)
         self.shutdownWorkers();
 
+        // The main executor's spawn cache still holds stacks the pool counts
+        // as in use (the workers gave theirs back as they stopped).
+        if (self.options.enable_main_executor) self.main_executor.spawn_cache.drain(self);
+
         // All tasks should be complete before deinit. A task holds its stack
         // until it finishes, so the pool's count of stacks in use covers them.
         std.debug.assert(self.stack_pool.in_use == 0);
