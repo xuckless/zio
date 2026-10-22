@@ -249,9 +249,18 @@ pub fn LocalRunQueue(comptime T: type, comptime stealable: bool) type {
         /// ring plus this node to the overflow queue (Go's runqput/runqputslow),
         /// so other executors can pick that work up. Without stealers the
         /// spill would only move the oldest tasks behind newer ones, so a
-        /// non-stealable ring spills just this node.
+        /// non-stealable ring spills just this node, and while anything waits
+        /// in its overflow queue every push goes there too: the ring and the
+        /// overflow queue are one FIFO queue, ring first. A push into a slot
+        /// the ring freed would otherwise pass every task waiting in the
+        /// overflow queue, and tasks that keep yielding would keep the ring
+        /// full and the overflow queue waiting for good.
         /// Returns true when the ring was empty before the push.
         pub fn push(self: *Self, node: *T) bool {
+            if (!stealable and !self.overflow.isEmpty()) {
+                self.overflow.push(node);
+                return false;
+            }
             while (true) {
                 const h = self.loadHead(); // synchronize with consumers
                 const t = self.ownTail(); // owner is the sole producer
@@ -918,6 +927,37 @@ test "LocalRunQueue: fillFromOverflow fills all free space" {
     expect = 0;
     while (q.pop()) |n| : (expect += 1) try testing.expectEqual(expect, n.id);
     try testing.expectEqual(100, expect);
+}
+
+test "LocalRunQueue: non-stealable push waits behind the overflow queue" {
+    const cap = TestLocalQueue.capacity;
+    var q: TestLocalQueue = .{};
+
+    const nodes = try testing.allocator.alloc(TestNode, cap + 1);
+    defer testing.allocator.free(nodes);
+    for (nodes, 0..) |*n, i| n.* = .{ .id = i };
+
+    // A full ring, and one more in the overflow queue.
+    for (nodes[0 .. cap + 1]) |*n| _ = q.push(n);
+    try testing.expectEqual(cap, q.len());
+
+    // The oldest task runs and comes back (a yield): it goes behind the one
+    // waiting in the overflow queue, not into the slot it freed.
+    const first = q.pop().?;
+    try testing.expectEqual(0, first.id);
+    _ = q.push(first);
+    try testing.expectEqual(cap - 1, q.len());
+
+    var order: std.ArrayList(usize) = .empty;
+    defer order.deinit(testing.allocator);
+    while (true) {
+        while (q.pop()) |n| try order.append(testing.allocator, n.id);
+        if (q.fillFromOverflow() == 0) break;
+    }
+    try testing.expectEqual(cap + 1, order.items.len);
+    for (order.items[0 .. cap - 1], 1..) |id, want| try testing.expectEqual(want, id);
+    try testing.expectEqual(cap, order.items[cap - 1]);
+    try testing.expectEqual(0, order.items[cap]);
 }
 
 test "LocalOverflowQueue: concurrent producers lose, duplicate or reorder no task" {

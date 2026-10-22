@@ -2819,6 +2819,38 @@ test "runtime: local ring overflow spills and drains with pinned scheduling" {
     try std.testing.expectEqual(@as(u32, H.n_tasks), counter.load(.monotonic));
 }
 
+test "runtime: a sleeping task wakes behind more yielding tasks than the ring holds" {
+    // One executor and tasks that keep yielding, more of them than the local
+    // ring holds (256): the rest wait in its overflow queue, and so does a
+    // task whose timer fires. That task must still get its turn; it waited
+    // for good while each yielding task went back into the ring slot it had
+    // just freed, ahead of everything in the overflow queue.
+    const rt = try Runtime.init(std.testing.allocator, .{ .executors = .exact(1) });
+    defer rt.deinit();
+
+    const W = struct {
+        stop: bool = false,
+
+        fn busy(w: *@This()) Cancelable!void {
+            while (!w.stop) try yield();
+        }
+
+        fn run(w: *@This(), io: std.Io, n: usize) !void {
+            var group: std.Io.Group = .init;
+            defer group.cancel(io);
+            defer w.stop = true;
+            for (0..n) |_| try group.concurrent(io, busy, .{w});
+            try io.sleep(.fromMilliseconds(10), .awake);
+        }
+    };
+
+    for ([_]usize{ 100, 300, 2000 }) |n| {
+        var w: W = .{};
+        var handle = try rt.spawn(W.run, .{ &w, rt.io(), n });
+        try handle.join();
+    }
+}
+
 test "runtime: spawnInto rejects fixed placements with work stealing" {
     if (!migrates) return error.SkipZigTest;
 
