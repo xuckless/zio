@@ -80,6 +80,11 @@ pub const Options = struct {
     /// connection per pass over its run queue. Off by default, as in
     /// lalinsky/zio#837; Anole turns it on.
     fast_accept: bool = build_options.fast_accept,
+    /// Count tasks spawned and finished per executor (one relaxed atomic add
+    /// each) and expose them, the run-queue length and the stack pool's use
+    /// through `Runtime.executorStats`. Off by default: the counters and the
+    /// snapshot compile away.
+    diagnostics: bool = build_options.diagnostics,
 };
 
 /// The resolved configuration. A `-fsingle-threaded` build has only one

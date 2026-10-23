@@ -670,6 +670,8 @@ pub const AnyTask = struct {
         else
             try executor.runtime.stack_pool.acquire();
 
+        if (comptime @import("runtime.zig").diagnostics_enabled) _ = executor.diag.spawned.fetchAdd(1, .monotonic);
+
         // Copy context data into the allocation
         const context_dest = self.closure.getContextSlice(AnyTask, self);
         @memcpy(context_dest, context);

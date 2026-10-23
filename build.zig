@@ -17,6 +17,8 @@ pub fn build(b: *std.Build) void {
     const debug_cancel = b.option(bool, "debug_cancel", "Report tasks that keep running after swallowing error.Canceled, with stack traces (default false)");
     const fast_accept = b.option(bool, "fast_accept", "Accept connections waiting in the backlog directly, and size the accept and spawn backpressure budgets to the run queue (default false)");
 
+    const diagnostics = b.option(bool, "diagnostics", "Count tasks and expose run-queue and stack gauges via Runtime.executorStats (default false)");
+
     const build_options: BuildOptions = .{
         .backend = backend,
         .scheduling = scheduling orelse .work_stealing,
@@ -25,6 +27,7 @@ pub fn build(b: *std.Build) void {
         .scheduler_metrics = scheduler_metrics orelse true,
         .debug_cancel = debug_cancel orelse false,
         .fast_accept = fast_accept orelse false,
+        .diagnostics = diagnostics orelse false,
     };
 
     const zio = b.addModule("zio", .{
@@ -141,6 +144,7 @@ const BuildOptions = struct {
     scheduler_metrics: bool,
     debug_cancel: bool,
     fast_accept: bool,
+    diagnostics: bool,
 
     // Enums are passed as tag names and mapped back to zio's own types in
     // src/options.zig.
@@ -153,6 +157,7 @@ const BuildOptions = struct {
         options.addOption(bool, "scheduler_metrics", self.scheduler_metrics);
         options.addOption(bool, "debug_cancel", self.debug_cancel);
         options.addOption(bool, "fast_accept", self.fast_accept);
+        options.addOption(bool, "diagnostics", self.diagnostics);
         return options;
     }
 };

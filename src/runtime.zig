@@ -450,6 +450,35 @@ pub const SchedulerMetrics = struct {
     }
 };
 
+/// Per-executor gauges, kept only with `Options.diagnostics`.
+pub const ExecutorStats = struct {
+    /// Tasks spawned onto / finished on this executor since start. Under
+    /// work stealing a task can finish elsewhere, so only the sum over all
+    /// executors is exact there; pinned, `spawned - finished` is exact.
+    spawned: u64 = 0,
+    finished: u64 = 0,
+    /// Tasks in the local run queue ring (a relaxed read).
+    run_queue: u32 = 0,
+    /// Whether the overflow queue holds tasks.
+    overflow_nonempty: bool = false,
+};
+
+/// Stack pool use, shared by all executors.
+pub const StackStats = struct {
+    in_use: usize = 0,
+    pool_size: usize = 0,
+    /// `in_use` times the pool's initial committed size: a lower bound of
+    /// the memory the stacks hold.
+    committed_bytes: usize = 0,
+};
+
+pub const diagnostics_enabled = zio_options.diagnostics;
+const DiagStorage = if (diagnostics_enabled) struct {
+    spawned: std.atomic.Value(u64) = .init(0),
+    finished: std.atomic.Value(u64) = .init(0),
+} else void;
+const diag_init: DiagStorage = if (diagnostics_enabled) .{} else {};
+
 const MetricsStorage = if (metrics_enabled) SchedulerMetrics else void;
 const metrics_storage_init: MetricsStorage = if (metrics_enabled) .{} else {};
 
@@ -524,6 +553,7 @@ pub const Executor = struct {
 
     // Scheduler event counters; written only by this executor's thread.
     metrics: MetricsStorage = metrics_storage_init,
+    diag: DiagStorage = diag_init,
 
     // True while drainDispatched signals a batch of task wakes:
     // scheduleTaskLocal skips the per-push announce, the drain announces
@@ -1442,6 +1472,7 @@ pub const Executor = struct {
                 self.pending_cleanup = .none;
                 task.state.store(.{ .tag = .finished }, .release);
                 task.releaseCoroLocal(self);
+                if (comptime diagnostics_enabled) _ = self.diag.finished.fetchAdd(1, .monotonic);
                 finishTask(&task.awaitable);
             },
         }
@@ -2172,6 +2203,33 @@ pub const Runtime = struct {
             }
         }
         return total;
+    }
+
+    /// A snapshot of one executor's gauges (see `Options.diagnostics`);
+    /// null for an index out of range or when diagnostics are off. Reads are
+    /// relaxed, so the numbers are approximate while executors run.
+    pub fn executorStats(self: *Runtime, index: usize) ?ExecutorStats {
+        if (comptime !diagnostics_enabled) return null;
+        if (index >= self.executors.items.len) return null;
+        const ex = self.executors.items[index];
+        return .{
+            .spawned = ex.diag.spawned.load(.monotonic),
+            .finished = ex.diag.finished.load(.monotonic),
+            .run_queue = ex.run_queue.len(),
+            .overflow_nonempty = !ex.run_queue.overflow.isEmpty(),
+        };
+    }
+
+    /// Number of executors `executorStats` can report.
+    pub fn executorCount(self: *Runtime) usize {
+        return self.executors.items.len;
+    }
+
+    /// Stack pool use (zeros when diagnostics are off).
+    pub fn stackStats(self: *Runtime) StackStats {
+        if (comptime !diagnostics_enabled) return .{};
+        const st = self.stack_pool.stats();
+        return .{ .in_use = st.in_use, .pool_size = st.pool_size, .committed_bytes = st.committed_bytes };
     }
 
     /// Whether other executors can steal from this runtime's queues. The
@@ -3405,4 +3463,30 @@ test "Runtime: a task waiting past idle_stack_trim gives back its deeper stack p
     };
     var handle = try runtime.spawn(worker.run, .{runtime});
     try handle.join();
+}
+
+test "Runtime: executorStats counts spawned and finished tasks" {
+    if (!diagnostics_enabled or builtin.single_threaded) return error.SkipZigTest;
+
+    const runtime = try Runtime.init(std.testing.allocator, .{});
+    defer runtime.deinit();
+
+    const S = struct {
+        fn work() void {}
+    };
+    var group: Group = .init;
+    defer group.cancel();
+    for (0..8) |_| try group.spawn(S.work, .{});
+    try group.wait();
+
+    var spawned: u64 = 0;
+    var finished: u64 = 0;
+    for (0..runtime.executorCount()) |i| {
+        const st = runtime.executorStats(i).?;
+        spawned += st.spawned;
+        finished += st.finished;
+    }
+    try std.testing.expect(spawned >= 8);
+    try std.testing.expect(finished >= 8);
+    try std.testing.expect(runtime.stackStats().in_use <= spawned);
 }
