@@ -16,6 +16,8 @@ pub const RuntimeOptions = runtime.RuntimeOptions;
 pub const JoinHandle = runtime.JoinHandle;
 pub const Placement = runtime.Placement;
 pub const ExecutorId = runtime.ExecutorId;
+pub const ExecutorStats = runtime.ExecutorStats;
+pub const StackStats = runtime.StackStats;
 
 // Standalone task functions
 pub const spawn = runtime.spawn;
