@@ -216,6 +216,10 @@ pub const AnyTask = struct {
     /// How many swallowed cancellations `Options.debug_cancel` has reported
     /// in this process, for a test runner to fail the test that caused one.
     pub var swallowed_cancels: std.atomic.Value(u64) = .init(0);
+    comptime {
+        // For a test runner that does not import zio: a weak extern of this name.
+        if (zio_options.debug_cancel) @export(&swallowed_cancels.raw, .{ .name = "zio_swallowed_cancels" });
+    }
 
     const CancelDebug = struct {
         addrs: [32]usize = undefined,
