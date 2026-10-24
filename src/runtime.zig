@@ -3365,6 +3365,7 @@ test "debug_cancel: reports a task that parks after swallowing error.Canceled" {
 
     const runtime = try Runtime.init(std.testing.allocator, .{});
     defer runtime.deinit();
+    const reports_before = @import("zio.zig").swallowedCancels();
 
     const T = struct {
         fn swallow() !void {
@@ -3394,6 +3395,8 @@ test "debug_cancel: reports a task that parks after swallowing error.Canceled" {
     propagating.cancel();
     try swallowing.join();
     try propagating.join();
+    // One report, counted for a test runner to see.
+    try std.testing.expectEqual(reports_before + 1, @import("zio.zig").swallowedCancels());
 }
 
 test "Runtime: currentExecutor names the calling executor" {

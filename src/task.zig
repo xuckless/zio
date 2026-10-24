@@ -213,6 +213,10 @@ pub const AnyTask = struct {
     /// See `Options.debug_cancel`. Only accessed by the task itself.
     cancel_debug: if (zio_options.debug_cancel) CancelDebug else void = if (zio_options.debug_cancel) .{} else {},
 
+    /// How many swallowed cancellations `Options.debug_cancel` has reported
+    /// in this process, for a test runner to fail the test that caused one.
+    pub var swallowed_cancels: std.atomic.Value(u64) = .init(0);
+
     const CancelDebug = struct {
         addrs: [32]usize = undefined,
         trace: ?std.debug.StackTrace = null,
@@ -550,6 +554,7 @@ pub const AnyTask = struct {
         const status: CanceledStatus = @bitCast(self.canceled_status.load(.acquire));
         if (status.pending_errors > 0 or status.shield_count > 0) return false;
         d.reported = true;
+        _ = swallowed_cancels.fetchAdd(1, .monotonic);
 
         std.debug.print("zio: task {*} parks on a cancelable wait after error.Canceled was delivered and not propagated\n", .{self});
         std.debug.print("error.Canceled was delivered at:\n", .{});

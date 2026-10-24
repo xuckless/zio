@@ -37,6 +37,11 @@ pub const checkCancel = runtime.checkCancel;
 pub const recancel = runtime.recancel;
 /// Held-lock accounting for `Options.debug_held_locks`.
 pub const held_locks = @import("held_locks.zig");
+/// How many swallowed cancellations `Options.debug_cancel` has reported so
+/// far (always 0 with the option off).
+pub fn swallowedCancels() u64 {
+    return @import("task.zig").AnyTask.swallowed_cancels.load(.monotonic);
+}
 /// The task the caller runs on, or null off a task. Another task may
 /// `cancel` it, as an armed `AutoCancel` would, for as long as it runs.
 pub const currentTask = runtime.getCurrentTaskOrNull;
