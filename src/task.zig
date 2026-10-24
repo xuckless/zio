@@ -480,6 +480,9 @@ pub const AnyTask = struct {
                     current = prev;
                     continue;
                 }
+                // The delivered error was the auto-cancel's own, taken back
+                // as a timeout: not swallowed.
+                if (zio_options.debug_cancel) self.cancel_debug.trace = null;
                 return true;
             }
 

@@ -3399,6 +3399,28 @@ test "debug_cancel: reports a task that parks after swallowing error.Canceled" {
     try std.testing.expectEqual(reports_before + 1, @import("zio.zig").swallowedCancels());
 }
 
+test "debug_cancel: a timeout from withTimeout is not a swallowed cancellation" {
+    if (!zio_options.debug_cancel) return error.SkipZigTest;
+
+    const runtime = try Runtime.init(std.testing.allocator, .{});
+    defer runtime.deinit();
+    const reports_before = @import("zio.zig").swallowedCancels();
+
+    const T = struct {
+        fn timesOut() !void {
+            const autocancel = @import("autocancel.zig");
+            try std.testing.expectError(error.Timeout, autocancel.withTimeout(.fromMilliseconds(1), sleep, .{Duration.fromSeconds(60)}));
+            // Parks again after its timeout: nothing was swallowed.
+            try sleep(.fromMilliseconds(1));
+            try std.testing.expect(!getCurrentTaskOrNull().?.cancel_debug.reported);
+        }
+    };
+
+    var task = try runtime.spawn(T.timesOut, .{});
+    try task.join();
+    try std.testing.expectEqual(reports_before, @import("zio.zig").swallowedCancels());
+}
+
 test "Runtime: currentExecutor names the calling executor" {
     const runtime = try Runtime.init(std.testing.allocator, .{});
     defer runtime.deinit();
