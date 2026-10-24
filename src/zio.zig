@@ -35,6 +35,8 @@ pub const beginShield = runtime.beginShield;
 pub const endShield = runtime.endShield;
 pub const checkCancel = runtime.checkCancel;
 pub const recancel = runtime.recancel;
+/// Held-lock accounting for `Options.debug_held_locks`.
+pub const held_locks = @import("held_locks.zig");
 /// The task the caller runs on, or null off a task. Another task may
 /// `cancel` it, as an armed `AutoCancel` would, for as long as it runs.
 pub const currentTask = runtime.getCurrentTaskOrNull;

@@ -313,6 +313,9 @@ pub const AnyTask = struct {
     pub fn yieldFrom(self: *AnyTask, initial_executor: *Executor, comptime mode: YieldMode, comptime cancel_mode: Executor.YieldCancelMode) if (cancel_mode == .allow_cancel) Cancelable!void else void {
         var executor = initial_executor;
 
+        // Options.debug_held_locks: no lock is held across a suspension point.
+        @import("held_locks.zig").checkSuspend();
+
         // Check and consume cancellation flag before yielding (unless no_cancel).
         // On the cancel-error return, `state` must be left untouched: the tag is
         // already .ready (we are running), and the awaken bit may hold a wake
