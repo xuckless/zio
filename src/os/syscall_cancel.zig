@@ -239,10 +239,13 @@ var install_mutex: thread.Mutex = .init();
 var install_count: usize = 0;
 var prev_action: posix.Sigaction = undefined;
 
-/// Install the process-global no-op `SIGURG` handler (refcounted; safe to call
-/// from each thread pool). The handler does nothing — its only job is to make
-/// blocking syscalls return `EINTR`, which requires the handler to be installed
-/// *without* `SA_RESTART`.
+/// Install the process-global `SIGURG` handler (refcounted; safe to call
+/// from each thread pool). For syscall cancellation the handler does
+/// nothing — its only job is to make blocking syscalls return `EINTR`, which
+/// requires the handler to be installed *without* `SA_RESTART`. It is also
+/// the stall watchdog's stack capture (src/diag.zig), which takes the
+/// signals it sent itself; the watchdog holds a reference too, so both share
+/// the one handler instead of replacing each other's.
 pub fn installHandler() void {
     if (!enabled) return;
     install_mutex.lock();
@@ -252,9 +255,12 @@ pub fn installHandler() void {
         return;
     }
     var act: posix.Sigaction = .{
-        .handler = .{ .handler = noopHandler },
+        .handler = .{ .sigaction = handler },
         .mask = posix.sigemptyset(),
-        .flags = 0, // no SA_RESTART: interrupted syscalls must return EINTR
+        // No SA_RESTART: interrupted syscalls must return EINTR. SA_ONSTACK:
+        // an executor thread's alternate stack, where it has one, so the
+        // capture adds no frame to the stack it walks.
+        .flags = posix.SA.SIGINFO | posix.SA.ONSTACK,
     };
     posix.sigaction(posix.SIG.URG, &act, &prev_action);
     install_count = 1;
@@ -271,7 +277,11 @@ pub fn uninstallHandler() void {
     posix.sigaction(posix.SIG.URG, &prev_action, null);
 }
 
-fn noopHandler(_: posix.SIG) callconv(.c) void {}
+fn handler(_: posix.SIG, _: *const posix.siginfo_t, uc: ?*anyopaque) callconv(.c) void {
+    @disableInstrumentation();
+    const diag = @import("../diag.zig");
+    if (comptime diag.signal_capture) _ = diag.onSignal(uc);
+}
 
 test "syscall_cancel: signal interrupts a blocking read" {
     if (!enabled) return;

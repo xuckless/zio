@@ -42,6 +42,15 @@ pub const held_locks = @import("held_locks.zig");
 pub fn swallowedCancels() u64 {
     return @import("task.zig").AnyTask.swallowed_cancels.load(.monotonic);
 }
+/// Every live task of every runtime in the process, with the stack of each
+/// suspended one, for a hang dump (src/diag.zig): compiled in with
+/// `Options.diagnostics` in a Debug or test build, a one-line note
+/// otherwise. Call it from a thread of its own, not from a task.
+pub const dumpTasks = @import("diag.zig").dumpAll;
+/// Whether `dumpTasks` and the executor stall watchdog are compiled in.
+pub const task_dump_enabled = @import("diag.zig").enabled;
+/// Settings of the stall watchdog (`RuntimeOptions.stall_watchdog`).
+pub const StallWatchdog = @import("diag.zig").StallWatchdog;
 /// The task the caller runs on, or null off a task. Another task may
 /// `cancel` it, as an armed `AutoCancel` would, for as long as it runs.
 pub const currentTask = runtime.getCurrentTaskOrNull;
@@ -129,4 +138,5 @@ test {
     _ = @import("stderr.zig");
     _ = @import("os/syscall_cancel.zig");
     _ = @import("compat.zig");
+    _ = @import("diag.zig");
 }

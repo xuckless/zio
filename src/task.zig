@@ -20,6 +20,7 @@ const os = @import("os/root.zig");
 const Timestamp = @import("time.zig").Timestamp;
 const StackInfo = @import("coro/stack.zig").StackInfo;
 const zio_options = @import("options.zig").options;
+const diag = @import("diag.zig");
 
 pub const Closure = struct {
     start: Start,
@@ -209,6 +210,10 @@ pub const AnyTask = struct {
     /// Head of this task's intrusive task-local binding chain (see `TaskLocal`).
     /// Only ever accessed by the task itself, so it needs no synchronization.
     tls_head: ?*TaskLocalNode = null,
+
+    /// On its spawn executor's live-task list for the task dump
+    /// (src/diag.zig), from `create` until it finishes or is destroyed.
+    debug_link: if (diag.enabled) diag.TaskLink else void = if (diag.enabled) .{} else {},
 
     /// See `Options.debug_cancel`. Only accessed by the task itself.
     cancel_debug: if (zio_options.debug_cancel) CancelDebug else void = if (zio_options.debug_cancel) .{} else {},
@@ -612,6 +617,9 @@ pub const AnyTask = struct {
 
     pub fn destroy(self: *AnyTask) void {
         const rt = self.getRuntime();
+        // A task destroyed without finishing (its spawn failed) is still
+        // listed; off the list before its stack goes.
+        if (comptime diag.enabled) diag.TaskList.unlink(&self.debug_link);
         self.releaseCoro(rt);
 
         self.closure.free(AnyTask, rt, self);
@@ -692,6 +700,8 @@ pub const AnyTask = struct {
         @memcpy(context_dest, context);
 
         self.coro.setup(&AnyTask.startFn, null);
+
+        if (comptime diag.enabled) executor.debug_diag.tasks.link(&self.debug_link);
 
         return self;
     }

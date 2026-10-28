@@ -20,10 +20,11 @@ TIMEOUT=""
 NO_LOG_CAPTURE=false
 FAST_ACCEPT=false
 DEBUG_CANCEL=false
+DIAGNOSTICS=false
 
 # Parse arguments
 usage() {
-  echo "Usage: $0 [--filter \"test name\"] [--target <target>] [--backend <backend>] [--scheduling <mode>] [--wine] [--qemu] [--no-exec] [--coverage] [--ci] [--full] [--release] [--fast-accept] [--debug-cancel] [--verbose] [--no-log-capture] [--timeout <seconds>]"
+  echo "Usage: $0 [--filter \"test name\"] [--target <target>] [--backend <backend>] [--scheduling <mode>] [--wine] [--qemu] [--no-exec] [--coverage] [--ci] [--full] [--release] [--fast-accept] [--debug-cancel] [--diagnostics] [--verbose] [--no-log-capture] [--timeout <seconds>]"
 }
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -91,6 +92,10 @@ while [[ $# -gt 0 ]]; do
             DEBUG_CANCEL=true
             shift
             ;;
+        --diagnostics)
+            DIAGNOSTICS=true
+            shift
+            ;;
         --timeout)
             [[ $# -ge 2 ]] || { echo "--timeout requires an argument"; usage; exit 1; }
             TIMEOUT="$2"; shift 2
@@ -139,6 +144,10 @@ fi
 if [ "$DEBUG_CANCEL" = true ]; then
     echo "Debug cancel: on"
     BUILD_ARGS+=("-Ddebug_cancel=true")
+fi
+if [ "$DIAGNOSTICS" = true ]; then
+    echo "Diagnostics: on"
+    BUILD_ARGS+=("-Ddiagnostics=true")
 fi
 
 if [ -n "$BACKEND" ]; then

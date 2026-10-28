@@ -18,7 +18,7 @@ pub fn build(b: *std.Build) void {
     const debug_held_locks = b.option(bool, "debug_held_locks", "Panic when a task suspends while it holds a lock counted through zio.held_locks (default false)");
     const fast_accept = b.option(bool, "fast_accept", "Accept connections waiting in the backlog directly, and size the accept and spawn backpressure budgets to the run queue (default false)");
 
-    const diagnostics = b.option(bool, "diagnostics", "Count tasks and expose run-queue and stack gauges via Runtime.executorStats (default false)");
+    const diagnostics = b.option(bool, "diagnostics", "Count tasks and expose run-queue and stack gauges via Runtime.executorStats; in Debug and test builds also keep a live-task list for zio.dumpTasks and run the executor stall watchdog (default false)");
 
     const build_options: BuildOptions = .{
         .backend = backend,
@@ -118,8 +118,21 @@ pub fn build(b: *std.Build) void {
     const emit_test_bin = b.option(bool, "emit-test-bin", "Build test binary without running") orelse false;
     const test_filter = b.option([]const u8, "test-filter", "Filter for test names");
 
+    // The tests get their own copy of the module with frame pointers kept
+    // in every mode: the task dump and the stall watchdog walk stacks by
+    // frame pointer (src/diag.zig), and their tests look for a function's
+    // name in what they print.
+    const zio_test = b.createModule(.{
+        .root_source_file = b.path("src/zio.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = target.result.os.tag != .freestanding,
+        .omit_frame_pointer = false,
+    });
+    zio_test.addOptions("zio_build_options", build_options.create(b));
+
     const lib_unit_tests = b.addTest(.{
-        .root_module = zio,
+        .root_module = zio_test,
         .test_runner = .{ .path = b.path("test_runner.zig"), .mode = .simple },
         .filters = if (test_filter) |f| &.{f} else &.{},
     });

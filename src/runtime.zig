@@ -39,6 +39,7 @@ const spawnBlockingTask = @import("blocking_task.zig").spawnBlockingTask;
 const Group = @import("group.zig").Group;
 
 const dns = @import("dns/root.zig");
+const diag = @import("diag.zig");
 
 const select = @import("select.zig");
 const common = @import("common.zig");
@@ -171,6 +172,10 @@ pub const RuntimeOptions = struct {
     enable_main_executor: bool = true,
     /// DNS resolver configuration.
     dns: DnsOptions = .{},
+    /// The executor stall watchdog (see src/diag.zig). Only compiled in
+    /// with `Options.diagnostics` in a Debug or test build; ignored
+    /// otherwise.
+    stall_watchdog: diag.StallWatchdog = .{},
 };
 
 pub const DnsOptions = struct {
@@ -554,6 +559,9 @@ pub const Executor = struct {
     // Scheduler event counters; written only by this executor's thread.
     metrics: MetricsStorage = metrics_storage_init,
     diag: DiagStorage = diag_init,
+    /// The live-task list and the stall watchdog's heartbeat (src/diag.zig;
+    /// `Options.diagnostics` in Debug and test builds only).
+    debug_diag: diag.ExecutorDiag = diag.executor_diag_init,
 
     // True while drainDispatched signals a batch of task wakes:
     // scheduleTaskLocal skips the per-push announce, the drain announces
@@ -706,6 +714,7 @@ pub const Executor = struct {
         self.main_task.coro.setCurrent();
         setCurrentExecutor(self);
         self.current_task = &self.main_task;
+        if (comptime diag.enabled) diag.recordThread(self);
     }
 
     /// Trims the stacks of the tasks waiting since an interval ago or
@@ -876,7 +885,10 @@ pub const Executor = struct {
         // until abort(); markCrashed additionally pins the thread as a
         // no-suspend region.
         self.current_task = null;
-        defer self.current_task = &self.main_task;
+        defer {
+            self.current_task = &self.main_task;
+            if (comptime diag.enabled) self.debug_diag.watch.beat(@intFromPtr(&self.main_task));
+        }
 
         // Process deferred cleanup (e.g. main task's park/reschedule)
         self.processCleanup();
@@ -919,7 +931,14 @@ pub const Executor = struct {
             if (has_work) {
                 try self.loop.poll(.zero);
             } else {
-                try self.parkAndSearch(check_ready);
+                // Parked waiting for work is not a stall (diag.Watchdog).
+                if (comptime diag.enabled) self.debug_diag.watch.idle.store(true, .monotonic);
+                const parked = self.parkAndSearch(check_ready);
+                if (comptime diag.enabled) {
+                    self.debug_diag.watch.idle.store(false, .monotonic);
+                    self.debug_diag.watch.beat(0);
+                }
+                try parked;
             }
 
             // Retune the tick budget from this batch. Skipped when we may have
@@ -1262,6 +1281,8 @@ pub const Executor = struct {
         // docs): a re-readied task may run repeatedly within a tick, but once
         // the budget is spent the executor polls I/O, so a self-looping task
         // can't starve timers or I/O.
+        // A scheduler pass: the stall watchdog's heartbeat (diag.Watch).
+        if (comptime diag.enabled) self.debug_diag.watch.beat(0);
         if (!self.tickBudgetLeft()) {
             return null;
         }
@@ -1277,6 +1298,7 @@ pub const Executor = struct {
         if (zio_options.fast_accept) self.runs +%= 1;
         const task = AnyTask.fromWaitNode(node);
         self.unlistIdle(task);
+        if (comptime diag.enabled) self.debug_diag.watch.running.store(@intFromPtr(task), .monotonic);
         return task;
     }
 
@@ -1471,6 +1493,8 @@ pub const Executor = struct {
             .finish => |task| {
                 self.pending_cleanup = .none;
                 task.state.store(.{ .tag = .finished }, .release);
+                // Off the dump's list before its stack goes.
+                if (comptime diag.enabled) diag.TaskList.unlink(&task.debug_link);
                 task.releaseCoroLocal(self);
                 if (comptime diagnostics_enabled) _ = self.diag.finished.fetchAdd(1, .monotonic);
                 finishTask(&task.awaitable);
@@ -1813,6 +1837,8 @@ pub const Runtime = struct {
     metrics_monitor: ?std.Thread = null,
     metrics_stop: std.atomic.Value(u32) = .init(0),
     own_self: bool = false,
+    /// Registry membership and the stall watchdog (src/diag.zig).
+    debug_diag: diag.RuntimeDiag = diag.runtime_diag_init,
 
     resolver: ?dns.Resolver = null,
 
@@ -1924,6 +1950,27 @@ pub const Runtime = struct {
                 self.metrics_monitor = try std.Thread.spawn(.{}, runMetricsMonitor, .{self});
             }
         }
+        errdefer if (self.metrics_monitor) |monitor| {
+            self.metrics_stop.store(1, .release);
+            os.Futex.wake(&self.metrics_stop, .one);
+            monitor.join();
+            self.metrics_monitor = null;
+        };
+
+        // Last: once listed, a dump may read the executors.
+        if (comptime diag.enabled) try diag.attach(self);
+    }
+
+    /// Every live task of this runtime and the stack of each suspended one
+    /// (src/diag.zig); a note saying it is not compiled in unless
+    /// `Options.diagnostics` is on in a Debug or test build. For a hang
+    /// dump, from a thread of its own.
+    pub fn dumpTasks(self: *Runtime, w: *std.Io.Writer) void {
+        if (comptime !diag.enabled) {
+            w.writeAll("zio task dump: not compiled in (needs Options.diagnostics in a Debug or test build)\n") catch {};
+            return;
+        }
+        diag.dumpRuntime(self, w);
     }
 
     /// Logs scheduler counter deltas every metrics_log_interval until deinit
@@ -2014,6 +2061,10 @@ pub const Runtime = struct {
 
         // Set shutting_down flag to prevent new spawns
         self.shutting_down.store(true, .release);
+
+        // Out of the dump's registry and the stall watchdog joined, before
+        // anything they read is torn down.
+        if (comptime diag.enabled) diag.detach(self);
 
         // The monitor reads executor state, so it must go before any of the
         // teardown below.
