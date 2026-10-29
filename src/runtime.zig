@@ -972,7 +972,11 @@ pub const Executor = struct {
                 // flag (both seq_cst); the executor clears the flag, then
                 // its tasks load the pointer (both seq_cst). Either the
                 // writer sees the executor online and waits for its next
-                // pass, or the executor's tasks see the new pointer.
+                // pass, or the executor's tasks see the new pointer. The
+                // readers' pointer loads must stay seq_cst for this (no
+                // fence on this edge, unlike liburcu's rcu_thread_online):
+                // an acquire load may be `ldapr` on arm64 and be satisfied
+                // before the `stlr` that clears the flag is visible.
                 if (comptime quiescent_state_enabled) self.quiescent.offline.store(true, .seq_cst);
                 const parked = self.parkAndSearch(check_ready);
                 if (comptime quiescent_state_enabled) self.quiescent.offline.store(false, .seq_cst);
@@ -1328,12 +1332,18 @@ pub const Executor = struct {
     }
 
     /// liburcu's `_rcu_quiescent_state_update_and_wakeup`: the counter
-    /// takes the grace-period number with a seq_cst store. Its release
-    /// half orders every section that ran before this pass ahead of it,
-    /// for the writer that reads it; the acquire load of the number orders
-    /// the writer's unpublishing ahead of every section after it, and the
-    /// seq_cst store against the sections' seq_cst pointer loads stands in
-    /// for liburcu's second `cmm_smp_mb()`.
+    /// takes the grace-period number with a seq_cst store.
+    /// - Sections before this pass: the store's release half orders them
+    ///   ahead of it, for the writer whose seq_cst load reads it (liburcu's
+    ///   first `cmm_smp_mb()`).
+    /// - Sections after this pass: the acquire load of the number reads a
+    ///   grace-period RMW that came after the writer's unpublishing store,
+    ///   so every later pointer load sees the new pointer. That is what
+    ///   orders them, not the store; liburcu's second `cmm_smp_mb()`, which
+    ///   keeps later reads from passing the counter store, has no part
+    ///   here, because the writer never relies on seeing the counter
+    ///   before a section's loads (it waits for a value >= its target,
+    ///   which the executor writes only after reading that number).
     noinline fn quiescentReport(self: *Executor) void {
         @branchHint(.cold);
         self.quiescent.ctr.store(self.runtime.quiescent_gp.value.load(.acquire), .seq_cst);
@@ -2358,6 +2368,12 @@ pub const Runtime = struct {
         if (comptime !quiescent_state_enabled) @compileError("zio: quiescentSnapshot needs Options.quiescent_state");
         // seq_cst: after the caller's unpublishing store in the single
         // total order, so an executor that sees this number sees that store.
+        // Every write to the number must stay a read-modify-write: an
+        // executor's acquire load may read a later writer's number, and it
+        // synchronizes with this writer's add only through the release
+        // sequence that the later RMWs continue. A plain store anywhere
+        // would end that sequence, and an executor could report a grace
+        // period passed without seeing this caller's unpublishing.
         return self.quiescent_gp.value.fetchAdd(1, .seq_cst) + 1;
     }
 
