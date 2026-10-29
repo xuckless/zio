@@ -18,6 +18,7 @@ pub fn build(b: *std.Build) void {
     const debug_held_locks = b.option(bool, "debug_held_locks", "Panic when a task suspends while it holds a lock counted through zio.held_locks (default false)");
     const fast_accept = b.option(bool, "fast_accept", "Accept connections waiting in the backlog directly, and size the accept and spawn backpressure budgets to the run queue (default false)");
 
+    const quiescent_state = b.option(bool, "quiescent_state", "Keep a quiescent-state counter per executor for Runtime.quiescentSnapshot/quiescentPassed (QSBR reclamation; default false)");
     const diagnostics = b.option(bool, "diagnostics", "Count tasks and expose run-queue and stack gauges via Runtime.executorStats; in Debug and test builds also keep a live-task list for zio.dumpTasks and run the executor stall watchdog (default false)");
 
     const build_options: BuildOptions = .{
@@ -30,6 +31,7 @@ pub fn build(b: *std.Build) void {
         .debug_held_locks = debug_held_locks orelse false,
         .fast_accept = fast_accept orelse false,
         .diagnostics = diagnostics orelse false,
+        .quiescent_state = quiescent_state orelse false,
     };
 
     const zio = b.addModule("zio", .{
@@ -161,6 +163,7 @@ const BuildOptions = struct {
     debug_held_locks: bool,
     fast_accept: bool,
     diagnostics: bool,
+    quiescent_state: bool,
 
     // Enums are passed as tag names and mapped back to zio's own types in
     // src/options.zig.
@@ -175,6 +178,7 @@ const BuildOptions = struct {
         options.addOption(bool, "debug_held_locks", self.debug_held_locks);
         options.addOption(bool, "fast_accept", self.fast_accept);
         options.addOption(bool, "diagnostics", self.diagnostics);
+        options.addOption(bool, "quiescent_state", self.quiescent_state);
         return options;
     }
 };

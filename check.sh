@@ -21,10 +21,11 @@ NO_LOG_CAPTURE=false
 FAST_ACCEPT=false
 DEBUG_CANCEL=false
 DIAGNOSTICS=false
+QUIESCENT_STATE=false
 
 # Parse arguments
 usage() {
-  echo "Usage: $0 [--filter \"test name\"] [--target <target>] [--backend <backend>] [--scheduling <mode>] [--wine] [--qemu] [--no-exec] [--coverage] [--ci] [--full] [--release] [--fast-accept] [--debug-cancel] [--diagnostics] [--verbose] [--no-log-capture] [--timeout <seconds>]"
+  echo "Usage: $0 [--filter \"test name\"] [--target <target>] [--backend <backend>] [--scheduling <mode>] [--wine] [--qemu] [--no-exec] [--coverage] [--ci] [--full] [--release] [--fast-accept] [--debug-cancel] [--diagnostics] [--quiescent-state] [--verbose] [--no-log-capture] [--timeout <seconds>]"
 }
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -96,6 +97,10 @@ while [[ $# -gt 0 ]]; do
             DIAGNOSTICS=true
             shift
             ;;
+        --quiescent-state)
+            QUIESCENT_STATE=true
+            shift
+            ;;
         --timeout)
             [[ $# -ge 2 ]] || { echo "--timeout requires an argument"; usage; exit 1; }
             TIMEOUT="$2"; shift 2
@@ -148,6 +153,10 @@ fi
 if [ "$DIAGNOSTICS" = true ]; then
     echo "Diagnostics: on"
     BUILD_ARGS+=("-Ddiagnostics=true")
+fi
+if [ "$QUIESCENT_STATE" = true ]; then
+    echo "Quiescent state: on"
+    BUILD_ARGS+=("-Dquiescent_state=true")
 fi
 
 if [ -n "$BACKEND" ]; then

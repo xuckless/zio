@@ -17,6 +17,9 @@ pub const JoinHandle = runtime.JoinHandle;
 pub const Placement = runtime.Placement;
 pub const ExecutorId = runtime.ExecutorId;
 pub const ExecutorStats = runtime.ExecutorStats;
+/// Whether `Options.quiescent_state` is on (`Runtime.quiescentSnapshot`,
+/// `Runtime.quiescentPassed`).
+pub const quiescent_state_enabled = runtime.quiescent_state_enabled;
 pub const StackStats = runtime.StackStats;
 
 // Standalone task functions

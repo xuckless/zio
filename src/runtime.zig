@@ -484,6 +484,35 @@ const DiagStorage = if (diagnostics_enabled) struct {
 } else void;
 const diag_init: DiagStorage = if (diagnostics_enabled) .{} else {};
 
+/// Whether `Options.quiescent_state` is on: each executor keeps a
+/// quiescent-state counter (`Executor.quiescent`) and the runtime a
+/// grace-period number (`Runtime.quiescent_gp`).
+pub const quiescent_state_enabled = zio_options.quiescent_state;
+
+/// An executor's quiescent state (`Options.quiescent_state`), on a cache
+/// line of its own: written by the executor only when a grace period has
+/// started since its last scheduler pass and around a park, read by
+/// writers waiting for a grace period. The liburcu QSBR reader state
+/// (`rcu_reader.ctr`, and 0 for offline), with the scheduler pass as
+/// `rcu_quiescent_state()` and the park as `rcu_thread_offline()`.
+const QuiescentStorage = if (quiescent_state_enabled) struct {
+    /// The last grace-period number this executor saw at a scheduler pass:
+    /// every task section that began before that pass has ended.
+    ctr: std.atomic.Value(u64) align(std.atomic.cache_line) = .init(0),
+    /// Parked in its event loop (or stopped): runs no task, so it holds
+    /// no grace period up.
+    offline: std.atomic.Value(bool) = .init(false),
+} else void;
+const quiescent_init: QuiescentStorage = if (quiescent_state_enabled) .{} else {};
+
+/// The runtime's grace-period number on a line of its own: read by every
+/// executor at each scheduler pass, written only when a grace period
+/// starts (`Runtime.quiescentSnapshot`).
+const QuiescentGp = if (quiescent_state_enabled) struct {
+    value: std.atomic.Value(u64) align(std.atomic.cache_line) = .init(0),
+} else void;
+const quiescent_gp_init: QuiescentGp = if (quiescent_state_enabled) .{} else {};
+
 const MetricsStorage = if (metrics_enabled) SchedulerMetrics else void;
 const metrics_storage_init: MetricsStorage = if (metrics_enabled) .{} else {};
 
@@ -562,6 +591,9 @@ pub const Executor = struct {
     /// The live-task list and the stall watchdog's heartbeat (src/diag.zig;
     /// `Options.diagnostics` in Debug and test builds only).
     debug_diag: diag.ExecutorDiag = diag.executor_diag_init,
+    /// The quiescent state of `Options.quiescent_state` (see
+    /// `QuiescentStorage`).
+    quiescent: QuiescentStorage = quiescent_init,
 
     // True while drainDispatched signals a batch of task wakes:
     // scheduleTaskLocal skips the per-push announce, the drain announces
@@ -920,6 +952,8 @@ pub const Executor = struct {
             // Exit if loop is stopped
             if (self.loop.stopped()) {
                 if (mode == .until_stopped) {
+                    // A stopped executor runs no more tasks.
+                    if (comptime quiescent_state_enabled) self.quiescent.offline.store(true, .seq_cst);
                     return;
                 }
                 @panic("event loop stopped while the main task was yielding");
@@ -933,7 +967,15 @@ pub const Executor = struct {
             } else {
                 // Parked waiting for work is not a stall (diag.Watchdog).
                 if (comptime diag.enabled) self.debug_diag.watch.idle.store(true, .monotonic);
+                // Nor does it hold up a grace period. seq_cst on both
+                // edges: a writer stores its new pointer, then reads this
+                // flag (both seq_cst); the executor clears the flag, then
+                // its tasks load the pointer (both seq_cst). Either the
+                // writer sees the executor online and waits for its next
+                // pass, or the executor's tasks see the new pointer.
+                if (comptime quiescent_state_enabled) self.quiescent.offline.store(true, .seq_cst);
                 const parked = self.parkAndSearch(check_ready);
+                if (comptime quiescent_state_enabled) self.quiescent.offline.store(false, .seq_cst);
                 if (comptime diag.enabled) {
                     self.debug_diag.watch.idle.store(false, .monotonic);
                     self.debug_diag.watch.beat(0);
@@ -1272,6 +1314,31 @@ pub const Executor = struct {
         return false;
     }
 
+    /// A scheduler pass reports a quiescent state. The fast path, every
+    /// pass: two relaxed loads, the runtime's grace-period number (a line
+    /// every executor reads and only a starting grace period writes) and
+    /// this executor's counter (its own line), and a compare. Only when a
+    /// grace period has started since the last pass does it store.
+    inline fn quiescentPass(self: *Executor) void {
+        const gp = self.runtime.quiescent_gp.value.load(.monotonic);
+        if (gp != self.quiescent.ctr.load(.monotonic)) {
+            @branchHint(.unlikely);
+            self.quiescentReport();
+        }
+    }
+
+    /// liburcu's `_rcu_quiescent_state_update_and_wakeup`: the counter
+    /// takes the grace-period number with a seq_cst store. Its release
+    /// half orders every section that ran before this pass ahead of it,
+    /// for the writer that reads it; the acquire load of the number orders
+    /// the writer's unpublishing ahead of every section after it, and the
+    /// seq_cst store against the sections' seq_cst pointer loads stands in
+    /// for liburcu's second `cmm_smp_mb()`.
+    noinline fn quiescentReport(self: *Executor) void {
+        @branchHint(.cold);
+        self.quiescent.ctr.store(self.runtime.quiescent_gp.value.load(.acquire), .seq_cst);
+    }
+
     /// Get the next task to run from the ready queue.
     ///
     /// Returns null if no tasks are available, or if the tick's quantum budget
@@ -1283,6 +1350,9 @@ pub const Executor = struct {
         // can't starve timers or I/O.
         // A scheduler pass: the stall watchdog's heartbeat (diag.Watch).
         if (comptime diag.enabled) self.debug_diag.watch.beat(0);
+        // And a quiescent state: the task that ran last has suspended or
+        // ended, so it holds no pointer read in a section.
+        if (comptime quiescent_state_enabled) self.quiescentPass();
         if (!self.tickBudgetLeft()) {
             return null;
         }
@@ -1839,6 +1909,8 @@ pub const Runtime = struct {
     own_self: bool = false,
     /// Registry membership and the stall watchdog (src/diag.zig).
     debug_diag: diag.RuntimeDiag = diag.runtime_diag_init,
+    /// The grace-period number of `Options.quiescent_state`.
+    quiescent_gp: QuiescentGp = quiescent_gp_init,
 
     resolver: ?dns.Resolver = null,
 
@@ -2274,6 +2346,36 @@ pub const Runtime = struct {
     /// Number of executors `executorStats` can report.
     pub fn executorCount(self: *Runtime) usize {
         return self.executors.items.len;
+    }
+
+    /// `Options.quiescent_state`: starts a grace period and returns its
+    /// number, for `quiescentPassed`. Call it after unpublishing an object
+    /// (a seq_cst store or swap of the pointer readers load with seq_cst):
+    /// once the grace period has passed, no task that could have loaded
+    /// the old pointer is still between the two suspension points around
+    /// that load. Any thread may call it; it never waits.
+    pub fn quiescentSnapshot(self: *Runtime) u64 {
+        if (comptime !quiescent_state_enabled) @compileError("zio: quiescentSnapshot needs Options.quiescent_state");
+        // seq_cst: after the caller's unpublishing store in the single
+        // total order, so an executor that sees this number sees that store.
+        return self.quiescent_gp.value.fetchAdd(1, .seq_cst) + 1;
+    }
+
+    /// `Options.quiescent_state`: whether grace period `target` (from
+    /// `quiescentSnapshot`) has passed: every executor has passed its
+    /// scheduler since it started, or is parked or stopped. Monotonic in
+    /// `target`: a later grace period passing implies every earlier one.
+    /// Any thread may call it; it never waits.
+    pub fn quiescentPassed(self: *Runtime, target: u64) bool {
+        if (comptime !quiescent_state_enabled) @compileError("zio: quiescentPassed needs Options.quiescent_state");
+        for (self.executors.items) |ex| {
+            // seq_cst: the loads pair with the executor's seq_cst stores
+            // (see quiescentReport and the park in run).
+            if (ex.quiescent.offline.load(.seq_cst)) continue;
+            if (ex.quiescent.ctr.load(.seq_cst) >= target) continue;
+            return false;
+        }
+        return true;
     }
 
     /// Stack pool use (zeros when diagnostics are off).
@@ -3565,4 +3667,76 @@ test "Runtime: executorStats counts spawned and finished tasks" {
     try std.testing.expect(spawned >= 8);
     try std.testing.expect(finished >= 8);
     try std.testing.expect(runtime.stackStats().in_use <= spawned);
+}
+
+/// For the quiescent_state tests: waits from a thread that is not an
+/// executor until grace period `target` has passed, polling with OS-thread
+/// yields. The 10 s limit is a hang guard, not a latency bound.
+fn waitQuiescentPassed(rt: *Runtime, target: u64) !void {
+    const start = Timestamp.now(.monotonic).toNanoseconds();
+    while (!rt.quiescentPassed(target)) {
+        if (Timestamp.now(.monotonic).toNanoseconds() -| start > 10 * std.time.ns_per_s) return error.GracePeriodNeverPassed;
+        std.Thread.yield() catch {};
+    }
+}
+
+test "quiescent_state: a grace period passes while every executor is idle" {
+    if (comptime !quiescent_state_enabled or builtin.single_threaded) return error.SkipZigTest;
+    // The test thread is not an executor: it waits with OS yields.
+    const rt = try Runtime.init(std.testing.allocator, .{ .executors = .exact(2), .enable_main_executor = false });
+    defer rt.deinit();
+    const first = rt.quiescentSnapshot();
+    try waitQuiescentPassed(rt, first);
+    // A later one passes too, and an earlier one has passed with it.
+    const second = rt.quiescentSnapshot();
+    try std.testing.expect(second > first);
+    try waitQuiescentPassed(rt, second);
+    try std.testing.expect(rt.quiescentPassed(first));
+}
+
+test "quiescent_state: an executor in a task holds a grace period until it passes its scheduler" {
+    if (comptime !quiescent_state_enabled or !multi_executor or migrates or builtin.single_threaded) return error.SkipZigTest;
+    const H = struct {
+        started: std.atomic.Value(bool) = .init(false),
+        go: std.atomic.Value(bool) = .init(false),
+
+        /// Runs without suspending until `go`: its executor passes no
+        /// scheduler meanwhile.
+        fn spin(h: *@This()) void {
+            h.started.store(true, .release);
+            while (!h.go.load(.acquire)) std.atomic.spinLoopHint();
+        }
+    };
+    const rt = try Runtime.init(std.testing.allocator, .{ .executors = .exact(2), .enable_main_executor = false });
+    defer rt.deinit();
+    var h: H = .{};
+    var handle = try rt.spawnInto(.{ .executor = 1 }, H.spin, .{&h});
+    while (!h.started.load(.acquire)) std.Thread.yield() catch {};
+    const target = rt.quiescentSnapshot();
+    // Executor 1 is inside the task, online, and has passed no scheduler
+    // since the grace period started.
+    try std.testing.expect(!rt.quiescentPassed(target));
+    h.go.store(true, .release);
+    handle.join();
+    try waitQuiescentPassed(rt, target);
+}
+
+test "quiescent_state: a parked executor is offline, and online when it runs a task" {
+    if (comptime !quiescent_state_enabled or !multi_executor or migrates or builtin.single_threaded) return error.SkipZigTest;
+    const H = struct {
+        fn offline() bool {
+            return getCurrentExecutor().quiescent.offline.load(.seq_cst);
+        }
+    };
+    const rt = try Runtime.init(std.testing.allocator, .{ .executors = .exact(2), .enable_main_executor = false });
+    defer rt.deinit();
+    const ex = rt.executors.items[1];
+    // With nothing to run it parks (hang guard as in waitQuiescentPassed).
+    const start = Timestamp.now(.monotonic).toNanoseconds();
+    while (!ex.quiescent.offline.load(.seq_cst)) {
+        if (Timestamp.now(.monotonic).toNanoseconds() -| start > 10 * std.time.ns_per_s) return error.NeverParked;
+        std.Thread.yield() catch {};
+    }
+    var handle = try rt.spawnInto(.{ .executor = 1 }, H.offline, .{});
+    try std.testing.expect(!handle.join());
 }

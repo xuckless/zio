@@ -93,6 +93,18 @@ pub const Options = struct {
     /// through `Runtime.executorStats`. Off by default: the counters and the
     /// snapshot compile away.
     diagnostics: bool = build_options.diagnostics,
+    /// Keep a quiescent-state counter per executor for quiescent-state-based
+    /// reclamation (the QSBR flavour of userspace RCU): a reader task holds
+    /// a shared pointer only between two suspension points, so once every
+    /// executor has passed its scheduler (or parked) after a writer
+    /// unpublished an object, no task still holds it.
+    /// `Runtime.quiescentSnapshot` starts a grace period and
+    /// `Runtime.quiescentPassed` says when it has ended. A scheduler pass
+    /// costs two relaxed loads (the runtime's grace-period number and the
+    /// executor's own counter) and a compare; the executor stores only
+    /// when a grace period has started since its last pass. Off by
+    /// default: everything compiles away.
+    quiescent_state: bool = build_options.quiescent_state,
 };
 
 /// The resolved configuration. A `-fsingle-threaded` build has only one
