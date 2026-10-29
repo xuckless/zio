@@ -73,7 +73,9 @@ pub const Options = struct {
     /// counts a held lock in `zio.held_locks`. The application counts its
     /// own locks; zio only checks at the one place a task can suspend. A
     /// task never suspends with the count above zero, so a thread-local
-    /// count is the running task's. Off by default: the check compiles away.
+    /// count is the running task's. The application may set
+    /// `zio.held_locks.report` to name the held locks before the panic.
+    /// Off by default: the check compiles away.
     debug_held_locks: bool = build_options.debug_held_locks,
     /// Let accept loops and other spawners keep up on a busy executor:
     /// `accept` takes a connection already waiting in the backlog without a

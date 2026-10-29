@@ -35,10 +35,22 @@ pub inline fn held() u32 {
     return if (enabled) count else 0;
 }
 
+/// The application's report for a task that suspends holding locks, set at
+/// run time (null: a plain panic). It receives the count, can name where
+/// each held lock was taken (the application keeps those sites, zio only
+/// the count), and must not return; the panic's own stack trace is the
+/// suspension site. Set it once, before any task can suspend holding a lock.
+pub var report: ?*const fn (count: u32) noreturn = null;
+
 /// Called where a task suspends.
 pub inline fn checkSuspend() void {
-    if (enabled and count != 0)
-        std.debug.panic("a task suspended while holding {d} lock(s): never hold a lock across a suspension point", .{count});
+    if (enabled and count != 0) suspendedHolding();
+}
+
+fn suspendedHolding() noreturn {
+    @branchHint(.cold);
+    if (report) |r| r(count);
+    std.debug.panic("a task suspended while holding {d} lock(s): never hold a lock across a suspension point", .{count});
 }
 
 test "held_locks: counts up and down" {
