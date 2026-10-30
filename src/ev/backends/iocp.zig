@@ -1387,11 +1387,6 @@ fn bindWildcard(handle: windows.SOCKET, family: u16) !void {
         addr.port = 0;
         addr.addr = @splat(0); // IN6ADDR_ANY
         bind_addr_len = @sizeOf(windows.sockaddr.in6);
-    } else if (family == windows.AF.UNIX) {
-        const addr: *windows.sockaddr.un = @ptrCast(&bind_addr_buf);
-        addr.family = windows.AF.UNIX;
-        addr.path = @splat(0); // Empty path for wildcard bind
-        bind_addr_len = @sizeOf(windows.sockaddr.un);
     } else {
         return error.Unexpected;
     }
@@ -1399,9 +1394,51 @@ fn bindWildcard(handle: windows.SOCKET, family: u16) !void {
     try net.bind(handle, @ptrCast(&bind_addr_buf), bind_addr_len);
 }
 
+/// Connects an AF_UNIX socket with a plain connect() and completes the op
+/// inline. ConnectEx is not used for AF_UNIX: it needs a bound socket, and the
+/// only "wildcard" name AF_UNIX has is the all-NUL one, which Windows takes as
+/// an abstract address (unsupported on current Windows: the bind succeeds,
+/// connections over it fail); ConnectEx after that bind was seen failing with
+/// WSAEFAULT. .NET ("ConnectEx supports connection-oriented sockets but not
+/// UDS", Socket.Windows.cs) and Go (ConnectEx for tcp only, net/fd_windows.go)
+/// connect AF_UNIX sockets with connect() too. A local connect is answered at
+/// once (the listener's backlog takes it or refuses it); should a nonblocking
+/// socket still report WSAEWOULDBLOCK, this waits with WSAPoll, as the poll
+/// backend does.
+fn connectUnix(data: *NetConnect) void {
+    net.connect(data.handle, data.addr, data.addr_len) catch |err| switch (err) {
+        error.WouldBlock, error.ConnectionPending => {
+            var pfd = [1]net.pollfd{.{ .fd = data.handle, .events = net.POLL.OUT, .revents = 0 }};
+            _ = net.poll(&pfd, -1) catch |poll_err| {
+                data.c.setError(poll_err);
+                return;
+            };
+            const sock_err = net.getSockError(data.handle) catch |get_err| {
+                data.c.setError(get_err);
+                return;
+            };
+            if (sock_err != 0) {
+                data.c.setError(net.errnoToConnectError(@fromBackingInt(@intCast(sock_err))));
+                return;
+            }
+        },
+        else => {
+            data.c.setError(err);
+            return;
+        },
+    };
+    data.c.setResult(.net_connect, {});
+}
+
 fn submitConnect(self: *Self, state: *LoopState, data: *NetConnect) !void {
     // Get address family from the target address
     const family: u16 = @as(*const windows.sockaddr, @ptrCast(@alignCast(data.addr))).family;
+
+    if (family == windows.AF.UNIX) {
+        connectUnix(data);
+        state.markCompletedFromBackend(&data.c);
+        return;
+    }
 
     // Load ConnectEx extension function for this address family
     const exts = self.shared_state.exts;

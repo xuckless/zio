@@ -2479,6 +2479,44 @@ test "UnixAddress: listen/accept/connect/read/write" {
     try checkListen(addr, UnixAddress.ListenOptions{}, &write_buffer);
 }
 
+/// Listens at `path`, connects to it, accepts, and passes one byte across.
+fn checkUnixConnect(path: []const u8) !void {
+    os.fs.dirDeleteFile(std.testing.allocator, os.fs.cwd(), path) catch {};
+    defer os.fs.dirDeleteFile(std.testing.allocator, os.fs.cwd(), path) catch {};
+
+    const addr = try UnixAddress.init(path);
+    const server = try addr.listen(.{});
+    defer server.close();
+    const client = try addr.connect(.{});
+    defer client.close();
+    const peer = try server.accept(.{});
+    defer peer.close();
+
+    try std.testing.expectEqual(@as(usize, 1), try client.socket.send("u", .none));
+    var buf: [1]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 1), try peer.socket.receive(&buf, .none));
+    try std.testing.expectEqual(@as(u8, 'u'), buf[0]);
+}
+
+test "UnixAddress: connect to a socket at a path of every length up to max_len" {
+    if (!has_unix_sockets) return error.SkipZigTest;
+
+    const runtime = try Runtime.init(std.testing.allocator, .{});
+    defer runtime.deinit();
+
+    // Relative names in the working directory, so every length from one
+    // byte to the limit is reachable.
+    const stem = "zio-test-unix-len-";
+    var name_buf: [UnixAddress.max_len]u8 = undefined;
+    for (&name_buf, 0..) |*ch, i| ch.* = if (i < stem.len) stem[i] else 'x';
+    for (1..UnixAddress.max_len + 1) |len| {
+        checkUnixConnect(name_buf[0..len]) catch |err| {
+            std.debug.print("path length {d}: {t}\n", .{ len, err });
+            return err;
+        };
+    }
+}
+
 test "UnixAddress: listen/accept/connect/read/write abstract" {
     if (!has_unix_sockets) return error.SkipZigTest;
     // The abstract namespace is a Linux-specific extension.
