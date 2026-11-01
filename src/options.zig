@@ -69,6 +69,28 @@ pub const Options = struct {
     /// it, the signature of a swallowed cancellation. The report prints the
     /// stack trace of the delivery and of the park, once per task.
     debug_cancel: bool = build_options.debug_cancel,
+    /// Panic when a task suspends (parks or yields) while the calling thread
+    /// counts a held lock in `zio.held_locks`. The application counts its
+    /// own locks; zio only checks at the one place a task can suspend. A
+    /// task never suspends with the count above zero, so a thread-local
+    /// count is the running task's. Off by default: the check compiles away.
+    debug_held_locks: bool = build_options.debug_held_locks,
+    /// Let accept loops and other spawners keep up on a busy executor:
+    /// `accept` takes a connection already waiting in the backlog without a
+    /// trip through the event loop, and the accept budget and the spawn
+    /// backpressure grow with the run queue (`Executor.roundBudget`): at
+    /// least 128 accepts and 64 spawns past the backpressure threshold
+    /// between yields, rather than one. An accept loop is asymmetric to the
+    /// rest of an application (one task feeding thousands), so without this
+    /// a pinned executor with thousands of busy connections accepts about one
+    /// connection per pass over its run queue. Off by default, as in
+    /// lalinsky/zio#837; Anole turns it on.
+    fast_accept: bool = build_options.fast_accept,
+    /// Count tasks spawned and finished per executor (one relaxed atomic add
+    /// each) and expose them, the run-queue length and the stack pool's use
+    /// through `Runtime.executorStats`. Off by default: the counters and the
+    /// snapshot compile away.
+    diagnostics: bool = build_options.diagnostics,
 };
 
 /// The resolved configuration. A `-fsingle-threaded` build has only one

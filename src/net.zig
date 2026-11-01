@@ -2479,6 +2479,44 @@ test "UnixAddress: listen/accept/connect/read/write" {
     try checkListen(addr, UnixAddress.ListenOptions{}, &write_buffer);
 }
 
+/// Listens at `path`, connects to it, accepts, and passes one byte across.
+fn checkUnixConnect(path: []const u8) !void {
+    os.fs.dirDeleteFile(std.testing.allocator, os.fs.cwd(), path) catch {};
+    defer os.fs.dirDeleteFile(std.testing.allocator, os.fs.cwd(), path) catch {};
+
+    const addr = try UnixAddress.init(path);
+    const server = try addr.listen(.{});
+    defer server.close();
+    const client = try addr.connect(.{});
+    defer client.close();
+    const peer = try server.accept(.{});
+    defer peer.close();
+
+    try std.testing.expectEqual(@as(usize, 1), try client.socket.send("u", .none));
+    var buf: [1]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 1), try peer.socket.receive(&buf, .none));
+    try std.testing.expectEqual(@as(u8, 'u'), buf[0]);
+}
+
+test "UnixAddress: connect to a socket at a path of every length up to max_len" {
+    if (!has_unix_sockets) return error.SkipZigTest;
+
+    const runtime = try Runtime.init(std.testing.allocator, .{});
+    defer runtime.deinit();
+
+    // Relative names in the working directory, so every length from one
+    // byte to the limit is reachable.
+    const stem = "zio-test-unix-len-";
+    var name_buf: [UnixAddress.max_len]u8 = undefined;
+    for (&name_buf, 0..) |*ch, i| ch.* = if (i < stem.len) stem[i] else 'x';
+    for (1..UnixAddress.max_len + 1) |len| {
+        checkUnixConnect(name_buf[0..len]) catch |err| {
+            std.debug.print("path length {d}: {t}\n", .{ len, err });
+            return err;
+        };
+    }
+}
+
 test "UnixAddress: listen/accept/connect/read/write abstract" {
     if (!has_unix_sockets) return error.SkipZigTest;
     // The abstract namespace is a Linux-specific extension.
@@ -3497,6 +3535,54 @@ test "Socket: receiveFromBatch keeps the first message when a later slot fails" 
     const n = try conn.socket.receiveFromBatch(&messages, .{ .duration = .fromSeconds(1) });
     try std.testing.expectEqual(1, n);
     try std.testing.expectEqualStrings("aaa", messages[0].buf[0..messages[0].len]);
+}
+
+test "Socket: a send flag the socket doesn't support fails" {
+    // Only Linux rejects MSG_OOB on UDP; FreeBSD and Wine send the datagram
+    // anyway, and macOS fails with an errno zio doesn't map.
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+
+    const runtime = try Runtime.init(std.testing.allocator, .{});
+    defer runtime.deinit();
+
+    const addr = try IpAddress.parseIp4("127.0.0.1", 0);
+    var sender = try addr.bind(.{});
+    defer sender.close();
+    var receiver = try addr.bind(.{});
+    defer receiver.close();
+
+    // UDP has no out-of-band data, so the flag has to reach the kernel for
+    // this to fail.
+    var iov = [_]os.iovec_const{os.net.iovecConstFromSlice("x")};
+    var op = ev.NetSendMsg.init(sender.handle, .{ .iovecs = &iov }, .{ .oob = true }, &receiver.address.any, getSockAddrLen(&receiver.address.any), null);
+    try waitForIo(&op.c);
+    try std.testing.expectError(error.OperationNotSupported, op.getResult());
+}
+
+test "Socket: a UDP receive is not failed by an ICMP error for an earlier datagram" {
+    // Windows fails the next receive with WSAECONNRESET once an ICMP port
+    // unreachable comes back for a datagram sent to a closed port, unless
+    // SIO_UDP_CONNRESET is off. POSIX systems never report it on an
+    // unconnected socket.
+    const runtime = try Runtime.init(std.testing.allocator, .{});
+    defer runtime.deinit();
+
+    const addr = try IpAddress.parseIp4("127.0.0.1", 0);
+    var socket = try addr.bind(.{});
+    defer socket.close();
+    var peer = try addr.bind(.{});
+    defer peer.close();
+
+    var gone = try addr.bind(.{});
+    const gone_address = gone.address;
+    gone.close();
+
+    _ = try socket.sendTo(gone_address, "lost", .none);
+    _ = try peer.sendTo(socket.address, "hello", .none);
+
+    var buf: [64]u8 = undefined;
+    const result = try socket.receiveFrom(&buf, .{ .duration = .fromSeconds(1) });
+    try std.testing.expectEqualStrings("hello", buf[0..result.len]);
 }
 
 test "Socket: receiveFromBatch drains multiple queued datagrams" {

@@ -114,6 +114,13 @@ pub const StackPool = struct {
     retain_target: usize,
     last_shrink: Timestamp,
 
+    /// A snapshot of the pool's use, taken under its lock.
+    pub fn stats(self: *StackPool) struct { in_use: usize, pool_size: usize, committed_bytes: usize } {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return .{ .in_use = self.in_use, .pool_size = self.pool_size, .committed_bytes = self.in_use * self.config.committed_size };
+    }
+
     pub fn init(config: Config) StackPool {
         // Same slot layout as stackAllocPosix: usable size rounded to pages,
         // plus the (never committed) guard page, at least two pages total.

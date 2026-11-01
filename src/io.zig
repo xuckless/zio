@@ -441,10 +441,14 @@ fn operateImpl(_: ?*anyopaque, operation: Io.Operation) Io.Cancelable!Io.Operati
     };
 }
 
+/// Every arm calls out rather than inlining: each operation's completion
+/// and vectors would otherwise share one frame the size of all of them,
+/// under every wait a task makes for I/O (and so on the stack of every
+/// idle connection).
 fn operateInner(operation: Io.Operation, timeout: time.Timeout, clock: time.Clock) (Io.Cancelable || common.Timeoutable)!Io.Operation.Result {
     switch (operation) {
         .file_read_streaming => |*o| return .{ .file_read_streaming = result: {
-            const n = fileReadStreamingImpl(o.file, o.data, timeout, clock) catch |err| switch (err) {
+            const n = @call(.never_inline, fileReadStreamingImpl, .{ o.file, o.data, timeout, clock }) catch |err| switch (err) {
                 error.Canceled => |e| return e,
                 error.Timeout => |e| return e,
                 else => |e| break :result e,
@@ -452,41 +456,34 @@ fn operateInner(operation: Io.Operation, timeout: time.Timeout, clock: time.Cloc
             break :result n;
         } },
         .file_write_streaming => |*o| return .{ .file_write_streaming = result: {
-            const n = fileWriteStreamingImpl(o.file, o.header, o.data, o.splat, timeout, clock) catch |err| switch (err) {
+            const n = @call(.never_inline, fileWriteStreamingImpl, .{ o.file, o.header, o.data, o.splat, timeout, clock }) catch |err| switch (err) {
                 error.Canceled => |e| return e,
                 error.Timeout => |e| return e,
                 else => |e| break :result e,
             };
             break :result n;
         } },
-        .device_io_control => |*o| return .{ .device_io_control = result: {
-            var op = if (builtin.os.tag == .windows)
-                ev.DeviceIoControl.init(stdIoHandleToZio(o.file.handle), o.code, o.in, o.out)
-            else
-                ev.DeviceIoControl.init(stdIoHandleToZio(o.file.handle), o.code, o.arg);
-            try timedWaitForIoClock(&op.c, timeout, clock);
-            break :result try op.getResult();
-        } },
+        .device_io_control => |*o| return .{ .device_io_control = try @call(.never_inline, deviceIoControlOp, .{ o, timeout, clock }) },
         .net_receive => |*o| return .{
             .net_receive = result: {
-                if (o.message_buffer.len > 1 and !o.flags.peek and !o.flags.trunc and !hasControl(o.message_buffer) and os_net.has_recvmmsg) {
-                    break :result netReceiveMmsg(o, timeout, clock) catch |err| switch (err) {
+                if (o.message_buffer.len > 1 and !o.flags.peek and !o.flags.trunc and os_net.has_recvmmsg) {
+                    break :result @call(.never_inline, netReceiveMmsg, .{ o, timeout, clock }) catch |err| switch (err) {
                         error.Canceled => |e| return e,
                         error.Timeout => |e| return e,
                     };
                 }
-                netReceiveImpl(o.socket_handle, &o.message_buffer[0], o.data_buffer, o.flags, false, timeout, clock) catch |err| switch (err) {
+                @call(.never_inline, netReceiveImpl, .{ o.socket_handle, &o.message_buffer[0], o.data_buffer, o.flags, false, timeout, clock }) catch |err| switch (err) {
                     error.Canceled => |e| return e,
                     error.Timeout => |e| return e,
                     error.WouldBlock => unreachable,
                     else => |e| break :result .{ e, 0 },
                 };
-                break :result netReceiveMore(o);
+                break :result @call(.never_inline, netReceiveMore, .{o});
             },
         },
-        .net_send => |*o| return .{ .net_send = try netSendOpImpl(o.socket_handle, o.messages, o.flags, timeout, clock) },
+        .net_send => |*o| return .{ .net_send = try @call(.never_inline, netSendOpImpl, .{ o.socket_handle, o.messages, o.flags, timeout, clock }) },
         .net_read => |*o| return .{ .net_read = result: {
-            const n = netReadOpImpl(o.socket_handle, o.data, timeout, clock) catch |err| switch (err) {
+            const n = @call(.never_inline, netReadOpImpl, .{ o.socket_handle, o.data, timeout, clock }) catch |err| switch (err) {
                 error.Canceled => |e| return e,
                 error.Timeout => |e| return e,
                 else => |e| break :result e,
@@ -494,7 +491,7 @@ fn operateInner(operation: Io.Operation, timeout: time.Timeout, clock: time.Cloc
             break :result .{ .data_len = n };
         } },
         .net_write => |*o| return .{ .net_write = result: {
-            const n = netWriteOpImpl(o.socket_handle, o.header, o.data, o.splat, timeout, clock) catch |err| switch (err) {
+            const n = @call(.never_inline, netWriteOpImpl, .{ o.socket_handle, o.header, o.data, o.splat, timeout, clock }) catch |err| switch (err) {
                 error.Canceled => |e| return e,
                 error.Timeout => |e| return e,
                 else => |e| break :result e,
@@ -502,6 +499,15 @@ fn operateInner(operation: Io.Operation, timeout: time.Timeout, clock: time.Cloc
             break :result n;
         } },
     }
+}
+
+fn deviceIoControlOp(o: anytype, timeout: time.Timeout, clock: time.Clock) !@FieldType(Io.Operation.Result, "device_io_control") {
+    var op = if (builtin.os.tag == .windows)
+        ev.DeviceIoControl.init(stdIoHandleToZio(o.file.handle), o.code, o.in, o.out)
+    else
+        ev.DeviceIoControl.init(stdIoHandleToZio(o.file.handle), o.code, o.arg);
+    try timedWaitForIoClock(&op.c, timeout, clock);
+    return try op.getResult();
 }
 
 /// Read from `file` at its current position into `data`, advancing the
@@ -2195,24 +2201,7 @@ fn netAcceptImpl(_: ?*anyopaque, server: Io.net.Socket.Handle, _: Io.net.Server.
         var peer_addr: zio_net.Address = undefined;
         var peer_addr_len: os_net.socklen_t = @sizeOf(zio_net.Address);
 
-        var op = ev.NetAccept.init(stdIoHandleToZio(server), &peer_addr.any, &peer_addr_len);
-        try waitForIo(&op.c);
-        const handle = op.getResult() catch |err| switch (err) {
-            error.ConnectionAborted => continue,
-            error.WouldBlock => return error.WouldBlock,
-            error.ProcessFdQuotaExceeded => return error.ProcessFdQuotaExceeded,
-            error.SystemFdQuotaExceeded => return error.SystemFdQuotaExceeded,
-            error.SystemResources => return error.SystemResources,
-            error.SocketNotListening => return error.SocketNotListening,
-            error.ProtocolFailure => return error.ProtocolFailure,
-            error.BlockedByFirewall => return error.BlockedByFirewall,
-            error.NetworkDown => return error.NetworkDown,
-            error.Canceled => return error.Canceled,
-            error.FileDescriptorNotASocket,
-            error.OperationNotSupported,
-            error.Unexpected,
-            => return error.Unexpected,
-        };
+        const handle = if (acceptNow(server, &peer_addr, &peer_addr_len)) |h| h else try acceptWait(server, &peer_addr, &peer_addr_len) orelse continue;
 
         switch (peer_addr.any.family) {
             os_net.AF.INET, os_net.AF.INET6 => os_net.setNoDelay(handle, true) catch {},
@@ -2229,6 +2218,86 @@ fn netAcceptImpl(_: ?*anyopaque, server: Io.net.Socket.Handle, _: Io.net.Server.
             },
         };
     }
+}
+
+/// Direct accepts in a row on this executor thread; see `acceptNow`.
+threadlocal var accept_burst: u32 = 0;
+/// Tokio's per-task coop budget: the least an acceptor takes in a turn.
+const min_accept_burst = 128;
+
+/// With `fast_accept` (otherwise null at once): accept a connection already
+/// waiting in the backlog without going through the loop, as Go's and
+/// Tokio's accept do; null when none is waiting (or on an error, which the
+/// loop path then reports).
+///
+/// Going through the loop parks the task even when the accept completes at
+/// once, and the park puts it behind every other ready task: with thousands
+/// of busy connections on one executor, the acceptor took one connection per
+/// pass over the run queue (~70/s at 4096 connections) while the backlog
+/// waited. The tick budget is no bound here either, since the busy
+/// connections have spent most of it by the time the acceptor runs. So, like
+/// Tokio, the acceptor gets a budget of its own: connections in a row up to
+/// `min_accept_burst`, or as many as the tasks that ran during its last trip
+/// to the back of the run queue if that is more (`Executor.roundBudget`),
+/// then another trip there. A fixed 128 per pass held one executor serving
+/// 25,000 busy connections to ~900 accepts a second, so a client connecting
+/// as many others did waited many seconds for its first byte while every
+/// client already in was served each pass.
+///
+/// Listening sockets are nonblocking on every POSIX backend (zio opens them
+/// so; servers set O_NONBLOCK on inherited ones, as the epoll backend's own
+/// optimistic accept already requires), so this never blocks the executor.
+fn acceptNow(server: Io.net.Socket.Handle, peer_addr: *zio_net.Address, peer_addr_len: *os_net.socklen_t) ?ev.Backend.NetHandle {
+    if (!zio_options.fast_accept or builtin.os.tag == .windows) return null;
+    const exec = runtime_mod.getCurrentExecutorOrNull() orelse return null;
+    const task = runtime_mod.getCurrentTaskOrNull() orelse return null;
+    if (accept_burst >= exec.roundBudget(min_accept_burst)) {
+        accept_burst = 0;
+        // The cancel check below reports a cancel that lands meanwhile.
+        exec.yieldForRound(task);
+    }
+    // A pending cancel goes to the loop path, which reports it. Checking
+    // consumes it, so it is put back: lost here, the loop path would park
+    // on the accept with no cancel left to wake it (a server's drain then
+    // waits for that accept loop for good).
+    task.checkCancel() catch {
+        task.recancel();
+        return null;
+    };
+    while (true) {
+        const handle = os_net.accept(stdIoHandleToZio(server), &peer_addr.any, peer_addr_len, .{ .nonblocking = true }) catch |err| switch (err) {
+            error.ConnectionAborted => continue,
+            else => {
+                accept_burst = 0;
+                return null;
+            },
+        };
+        accept_burst += 1;
+        return handle;
+    }
+}
+
+/// Accept through the loop: wait until a connection arrives. Null means the
+/// connection was aborted before it was accepted; try again.
+fn acceptWait(server: Io.net.Socket.Handle, peer_addr: *zio_net.Address, peer_addr_len: *os_net.socklen_t) Io.net.Server.AcceptError!?ev.Backend.NetHandle {
+    var op = ev.NetAccept.init(stdIoHandleToZio(server), &peer_addr.any, peer_addr_len);
+    try waitForIo(&op.c);
+    return op.getResult() catch |err| switch (err) {
+        error.ConnectionAborted => null,
+        error.WouldBlock => return error.WouldBlock,
+        error.ProcessFdQuotaExceeded => return error.ProcessFdQuotaExceeded,
+        error.SystemFdQuotaExceeded => return error.SystemFdQuotaExceeded,
+        error.SystemResources => return error.SystemResources,
+        error.SocketNotListening => return error.SocketNotListening,
+        error.ProtocolFailure => return error.ProtocolFailure,
+        error.BlockedByFirewall => return error.BlockedByFirewall,
+        error.NetworkDown => return error.NetworkDown,
+        error.Canceled => return error.Canceled,
+        error.FileDescriptorNotASocket,
+        error.OperationNotSupported,
+        error.Unexpected,
+        => return error.Unexpected,
+    };
 }
 
 fn openErrToBindErr(err: OpenOrCancel) Io.net.IpAddress.BindError {
@@ -2515,9 +2584,10 @@ fn zioSendFlags(flags: Io.net.SendFlags) os_net.SendFlags {
     };
 }
 
-/// Sends each message in turn, reporting how many made it. A partial count is
-/// part of the contract, so a caller that gets fewer than it passed re-submits
-/// the rest; that is what lets the batch path below send just one.
+/// Sends the messages in batches, reporting how many made it. A partial count
+/// is part of the contract, so a caller that gets fewer than it passed
+/// re-submits the rest; that is what lets the batch path below send just one,
+/// and how this loop continues after a batch that came back short.
 fn netSendOpImpl(
     handle: Io.net.Socket.Handle,
     messages: []Io.net.OutgoingMessage,
@@ -2526,22 +2596,38 @@ fn netSendOpImpl(
     clock: time.Clock,
 ) (Io.Cancelable || common.Timeoutable)!Io.Operation.NetSend.Result {
     const zio_flags = zioSendFlags(flags);
+    const deadline = timeout.toDeadlineOn(clock);
+    var addrs: [max_mmsg_slots]zio_net.IpAddress = undefined;
+    var slots: [max_mmsg_slots]ev.NetSendMmsg.Slot = undefined;
 
-    for (messages, 0..) |*msg, i| {
-        const zio_addr = stdIoIpToZio(msg.address.*);
-        const iovec = os_net.iovecConstFromSlice(msg.data_ptr[0..msg.data_len]);
+    var i: usize = 0;
+    while (i < messages.len) {
+        const batch = messages[i..][0..@min(messages.len - i, max_mmsg_slots)];
+        for (batch, addrs[0..batch.len], slots[0..batch.len]) |msg, *addr, *slot| {
+            addr.* = stdIoIpToZio(msg.address.*);
+            slot.* = .{
+                .data = msg.data_ptr[0..msg.data_len],
+                .addr = &addr.any,
+                .addr_len = sockAddrLen(&addr.any),
+                .control = if (msg.control.len != 0) msg.control else null,
+            };
+        }
 
-        var op = ev.NetSendMsg.init(
-            stdIoHandleToZio(handle),
-            .{ .iovecs = (&iovec)[0..1] },
-            zio_flags,
-            &zio_addr.any,
-            sockAddrLen(&zio_addr.any),
-            if (msg.control.len != 0) msg.control else null,
-        );
-        try timedWaitForIoClock(&op.c, timeout, clock);
+        var op = ev.NetSendMmsg.init(stdIoHandleToZio(handle), slots[0..batch.len], zio_flags);
+        timedWaitForIoClock(&op.c, deadline, clock) catch |err| {
+            // A failed wait means this batch sent nothing, but the earlier
+            // ones can't be taken back, so the caller gets their count, and a
+            // cancellation is left for its next cancellation point.
+            if (i == 0) return err;
+            switch (err) {
+                error.Canceled => runtime_mod.recancel(),
+                error.Timeout => {},
+            }
+            return .{ null, i };
+        };
         const sent = op.getResult() catch |err| return .{ sendErrToSocketSendErr(err), i };
-        msg.data_len = sent;
+        for (batch[0..sent], slots[0..sent]) |*msg, slot| msg.data_len = slot.sent_len;
+        i += sent;
     }
     return .{ null, messages.len };
 }
@@ -2627,13 +2713,6 @@ fn decodeIncomingFlags(raw: u32) Io.net.IncomingMessage.Flags {
     }
 }
 
-fn hasControl(messages: []const Io.net.IncomingMessage) bool {
-    for (messages) |m| {
-        if (m.control.len != 0) return true;
-    }
-    return false;
-}
-
 const max_mmsg_slots = 64;
 
 fn netReceiveMmsg(
@@ -2653,7 +2732,7 @@ fn netReceiveMmsg(
     for (0..n) |i| {
         const start = i * chunk;
         const end = if (i + 1 == n) o.data_buffer.len else start + chunk;
-        slots[i] = .{ .data = o.data_buffer[start..end] };
+        slots[i] = .{ .data = o.data_buffer[start..end], .control = o.message_buffer[i].control };
     }
 
     const zio_flags: os_net.RecvFlags = .{
@@ -2676,7 +2755,7 @@ fn netReceiveMmsg(
         o.message_buffer[i] = .{
             .from = senderAddrToStdIo(@ptrCast(&slots[i].addr), slots[i].addr_len),
             .data = slots[i].data[0..slots[i].received_len],
-            .control = &.{},
+            .control = slots[i].control[0..slots[i].control_len],
             .flags = decodeIncomingFlags(slots[i].msg_flags),
         };
     }
@@ -3489,6 +3568,119 @@ test "io: net TCP listen/connect/accept handshake" {
     try handle.join();
 }
 
+test "io: net TCP accept reports a cancel pending before it, with a connection waiting" {
+    const rt = try Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+
+    const Worker = struct {
+        fn run(io: Io) !void {
+            var server = try Io.net.IpAddress.listen(&.{ .ip4 = .loopback(0) }, io, .{ .reuse_address = true });
+            defer server.deinit(io);
+            // A connection waits in the backlog, so an accept that missed
+            // the cancel returns it instead of parking for good.
+            const client = try Io.net.IpAddress.connect(&server.socket.address, io, .{ .mode = .stream });
+            defer client.close(io);
+
+            // Canceled before its first accept, as an accept loop is when
+            // its server stops right after starting it.
+            _ = runtime_mod.getCurrentTask().setCanceled(.user);
+            const accepted = server.accept(io);
+            if (accepted) |s| s.close(io) else |_| {}
+            try std.testing.expectError(error.Canceled, accepted);
+        }
+    };
+
+    var handle = try rt.spawn(Worker.run, .{rt.io()});
+    try handle.join();
+}
+
+test "io: net TCP accept behind a long run queue takes a waiting backlog in a few passes" {
+    // One executor with two thousand tasks that keep yielding, and fifteen
+    // hundred clients in the listener's backlog. At a fixed 128 accepts a
+    // turn the acceptor would take a dozen passes over the busy tasks to let
+    // them in, the way one serving 25,000 busy connections took many seconds
+    // (each pass ~200 ms) while the clients behind it timed out. With the
+    // budget grown to the length of a pass (`Executor.roundBudget`), two.
+    // Linux only: the backlog has to hold every client (macOS caps it at 128
+    // by default). Pinned only: under work stealing, a task sent to the back
+    // behind two thousand tasks that keep yielding on one executor did not
+    // come back within minutes, with or without this budget (not looked
+    // into further).
+    if (!zio_options.fast_accept or builtin.os.tag != .linux or zio_options.scheduling != .pinned) return error.SkipZigTest;
+    const n_clients = 1500;
+    const n_busy = 2000;
+    {
+        var buf: [32]u8 = undefined;
+        const f = std.c.fopen("/proc/sys/net/core/somaxconn", "r") orelse return error.SkipZigTest;
+        defer _ = std.c.fclose(f);
+        const n = std.c.fread(&buf, 1, buf.len, f);
+        const somaxconn = std.fmt.parseInt(u32, std.mem.trim(u8, buf[0..n], " \n"), 10) catch return error.SkipZigTest;
+        if (somaxconn < n_clients) return error.SkipZigTest;
+    }
+    // Both ends of every connection: raise the soft descriptor limit.
+    {
+        var lim: std.c.rlimit = undefined;
+        if (std.c.getrlimit(.NOFILE, &lim) != 0) return error.SkipZigTest;
+        const want: std.c.rlim_t = 2 * n_clients + 256;
+        if (lim.max < want) return error.SkipZigTest;
+        if (lim.cur < want) {
+            lim.cur = want;
+            if (std.c.setrlimit(.NOFILE, &lim) != 0) return error.SkipZigTest;
+        }
+    }
+
+    const rt = try Runtime.init(std.testing.allocator, .{ .executors = .exact(1) });
+    defer rt.deinit();
+
+    const W = struct {
+        passes: u32 = 0,
+        stop: bool = false,
+
+        fn busy(w: *@This(), first: bool) Io.Cancelable!void {
+            while (!w.stop) {
+                if (first) w.passes += 1;
+                try runtime_mod.yield();
+            }
+        }
+
+        fn run(w: *@This(), io: Io) !void {
+            var server = try Io.net.IpAddress.listen(&.{ .ip4 = .loopback(0) }, io, .{ .reuse_address = true, .kernel_backlog = n_clients + 64 });
+            defer server.deinit(io);
+
+            var clients: [n_clients]Io.net.Stream = undefined;
+            var n_connected: usize = 0;
+            defer for (clients[0..n_connected]) |c| c.close(io);
+            while (n_connected < n_clients) : (n_connected += 1) {
+                clients[n_connected] = try Io.net.IpAddress.connect(&server.socket.address, io, .{ .mode = .stream });
+            }
+
+            var group: Io.Group = .init;
+            defer group.cancel(io);
+            defer w.stop = true;
+            for (0..n_busy) |i| try group.concurrent(io, busy, .{ w, i == 0 });
+            // Behind them all.
+            try runtime_mod.yield();
+
+            var accepted: [n_clients]Io.net.Stream = undefined;
+            var n_accepted: usize = 0;
+            defer for (accepted[0..n_accepted]) |c| c.close(io);
+            const before = w.passes;
+            while (n_accepted < n_clients) : (n_accepted += 1) {
+                accepted[n_accepted] = try server.accept(io);
+            }
+            const passes = w.passes - before;
+            if (passes > 3) {
+                std.debug.print("{d} passes to accept {d} connections\n", .{ passes, n_clients });
+                return error.TestUnexpectedResult;
+            }
+        }
+    };
+
+    var w: W = .{};
+    var handle = try rt.spawn(W.run, .{ &w, rt.io() });
+    try handle.join();
+}
+
 test "io: net TCP connected and accepted streams have Nagle's algorithm disabled" {
     const rt = try Runtime.init(std.testing.allocator, .{});
     defer rt.deinit();
@@ -3906,6 +4098,116 @@ test "io: net UDP sendMany delivers multiple datagrams" {
     }
 }
 
+test "io: net UDP sendMany delivers more datagrams than one batch, each to its own address" {
+    const rt = try Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+    const io = rt.io();
+
+    var sender = try Io.net.IpAddress.bind(&.{ .ip4 = .loopback(0) }, io, .{ .mode = .dgram });
+    defer sender.close(io);
+
+    var receivers: [2]Io.net.Socket = undefined;
+    for (&receivers) |*r| r.* = try Io.net.IpAddress.bind(&.{ .ip4 = .loopback(0) }, io, .{ .mode = .dgram });
+    defer for (&receivers) |*r| r.close(io);
+
+    const count = 150;
+    var payloads: [count][4]u8 = undefined;
+    var messages: [count]Io.net.OutgoingMessage = undefined;
+    for (&messages, &payloads, 0..) |*m, *p, i| {
+        std.mem.writeInt(u32, p, @intCast(i), .little);
+        m.* = .{ .address = &receivers[i % 2].address, .data_ptr = p, .data_len = p.len };
+    }
+
+    try sender.sendMany(io, &messages, .{});
+
+    for (messages) |m| {
+        try std.testing.expectEqual(4, m.data_len);
+    }
+
+    var buf: [16]u8 = undefined;
+    for (0..count) |i| {
+        const msg = try receivers[i % 2].receive(io, &buf);
+        try std.testing.expectEqual(4, msg.data.len);
+        try std.testing.expectEqual(i, std.mem.readInt(u32, msg.data[0..4], .little));
+    }
+}
+
+test "io: net UDP sendMany reports an error in the middle of a batch with the count sent before it" {
+    // IOCP completes a send that fails with WSAEMSGSIZE right away, but a
+    // completion packet still follows for it.
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const rt = try Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+    const io = rt.io();
+
+    var sender = try Io.net.IpAddress.bind(&.{ .ip4 = .loopback(0) }, io, .{ .mode = .dgram });
+    defer sender.close(io);
+
+    var receiver = try Io.net.IpAddress.bind(&.{ .ip4 = .loopback(0) }, io, .{ .mode = .dgram });
+    defer receiver.close(io);
+
+    // Larger than any IPv4 UDP datagram, so this one fails with EMSGSIZE.
+    const bad = 70;
+    var oversized: [70000]u8 = undefined;
+    @memset(&oversized, 0);
+
+    const count = 150;
+    var payloads: [count][4]u8 = undefined;
+    var messages: [count]Io.net.OutgoingMessage = undefined;
+    for (&messages, &payloads, 0..) |*m, *p, i| {
+        std.mem.writeInt(u32, p, @intCast(i), .little);
+        m.* = .{ .address = &receiver.address, .data_ptr = p, .data_len = p.len };
+    }
+    messages[bad] = .{ .address = &receiver.address, .data_ptr = &oversized, .data_len = oversized.len };
+
+    const err, const sent = sender.sendManyTimeout(io, &messages, .{}, .none);
+    try std.testing.expectEqual(error.MessageOversize, err.?);
+    try std.testing.expectEqual(bad, sent);
+
+    var buf: [16]u8 = undefined;
+    for (0..bad) |i| {
+        try std.testing.expectEqual(4, messages[i].data_len);
+        const msg = try receiver.receive(io, &buf);
+        try std.testing.expectEqual(4, msg.data.len);
+        try std.testing.expectEqual(i, std.mem.readInt(u32, msg.data[0..4], .little));
+    }
+}
+
+test "io: net sendManyTimeout reports the count sent before a timeout" {
+    // WSASendMsg only takes datagram sockets, and a datagram send never waits.
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const rt = try Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+    const io = rt.io();
+
+    // A stream socket whose peer never reads, so the send buffer fills up
+    // after the first batches and the rest waits until the timeout.
+    const address: Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var server = try address.listen(io, .{});
+    defer server.deinit(io);
+    const client = try server.socket.address.connect(io, .{ .mode = .stream });
+    defer client.close(io);
+    const conn = try server.accept(io);
+    defer conn.close(io);
+
+    var chunk: [64 * 1024]u8 = undefined;
+    @memset(&chunk, 0);
+    var messages: [1000]Io.net.OutgoingMessage = undefined;
+    for (&messages) |*m| {
+        m.* = .{ .address = &server.socket.address, .data_ptr = &chunk, .data_len = chunk.len };
+    }
+
+    const err, const sent = client.socket.sendManyTimeout(io, &messages, .{}, .{ .duration = .{
+        .raw = .fromMilliseconds(100),
+        .clock = .awake,
+    } });
+    try std.testing.expectEqual(null, err);
+    try std.testing.expect(sent > 0);
+    try std.testing.expect(sent < messages.len);
+}
+
 test "io: netLookup resolves numeric IPv4" {
     const rt = try Runtime.init(std.testing.allocator, .{});
     defer rt.deinit();
@@ -4125,11 +4427,9 @@ test "io: file positional read/write round-trip" {
 
 test "io: file streaming read advances position and reports EOF" {
     // On Windows, zio opens files with FILE_FLAG_OVERLAPPED (for IOCP). Such
-    // handles have no implicit file position, so ReadFile/WriteFile without an
-    // OVERLAPPED struct fails with INVALID_PARAMETER. Streaming requires
-    // per-handle position tracking which we don't implement.
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
-
+    // handles have no implicit file position: streaming I/O reads and moves
+    // the position the file object holds (os/fs.zig, windowsStreamingTransfer),
+    // which seeks move too.
     var t = try TestDirFixture.init();
     defer t.deinit();
     const io = t.rt.io();
@@ -4155,9 +4455,6 @@ test "io: file streaming read advances position and reports EOF" {
 }
 
 test "io: file streaming write advances position and appends" {
-    // See note on Windows in the streaming-read test above.
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
-
     var t = try TestDirFixture.init();
     defer t.deinit();
     const io = t.rt.io();
@@ -4180,10 +4477,6 @@ test "io: file streaming write advances position and appends" {
 }
 
 test "io: file seek moves the streaming position" {
-    // See note on Windows in the streaming-read test above: without an implicit
-    // file position there is nothing for a seek to move.
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
-
     var t = try TestDirFixture.init();
     defer t.deinit();
     const io = t.rt.io();
@@ -5073,6 +5366,58 @@ test "io: receiveManyTimeout returns every datagram already queued" {
     const err2, const n2 = receiver.receiveManyTimeout(io, &messages, &buf, .{}, .{ .duration = .{ .raw = .fromMilliseconds(10), .clock = .awake } });
     try std.testing.expect(err2.? == error.Timeout);
     try std.testing.expectEqual(0, n2);
+}
+
+test "io: sendManyTimeout and receiveManyTimeout carry several datagrams with control messages" {
+    // IP_RECVTOS and its control message are POSIX only.
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const rt = try Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+    const io = rt.io();
+
+    var sender = try Io.net.IpAddress.bind(&.{ .ip4 = .loopback(0) }, io, .{ .mode = .dgram });
+    defer sender.close(io);
+    var receiver = try Io.net.IpAddress.bind(&.{ .ip4 = .loopback(0) }, io, .{ .mode = .dgram });
+    defer receiver.close(io);
+    // The TOS byte of each datagram comes with it, as a control message.
+    const one: c_int = 1;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.setsockopt(receiver.handle, std.posix.IPPROTO.IP, std.posix.IP.RECVTOS, @ptrCast(&one), @sizeOf(c_int)));
+
+    const payloads = [_][]const u8{ "one", "two", "three", "four", "five" };
+    var out: [payloads.len]Io.net.OutgoingMessage = undefined;
+    for (&out, payloads) |*m, p| m.* = .{ .address = &receiver.address, .data_ptr = p.ptr, .data_len = p.len };
+    const send_err, const sent = sender.sendManyTimeout(io, &out, .{}, .none);
+    try std.testing.expectEqual(null, send_err);
+    try std.testing.expectEqual(payloads.len, sent);
+    for (out, payloads) |m, p| try std.testing.expectEqual(p.len, m.data_len);
+
+    var messages: [8]Io.net.IncomingMessage = @splat(.init);
+    var controls: [8][64]u8 align(Io.net.cmsg_align) = undefined;
+    var buf: [8 * 64]u8 = undefined;
+    const timeout: Io.Timeout = .{ .duration = .{ .raw = .fromSeconds(1), .clock = .awake } };
+    var seen: usize = 0;
+    while (seen < payloads.len) {
+        for (&messages, &controls) |*m, *ctl| {
+            m.* = .init;
+            m.control = ctl;
+        }
+        const err, const n = receiver.receiveManyTimeout(io, &messages, &buf, .{}, timeout);
+        try std.testing.expectEqual(null, err);
+        try std.testing.expect(n > 0);
+        // Linux loopback delivery finishes inside send: one call has them all.
+        if (builtin.os.tag == .linux) try std.testing.expectEqual(payloads.len, n);
+        for (messages[0..n]) |*message| {
+            try std.testing.expectEqualStrings(payloads[seen], message.data);
+            try std.testing.expectEqual(sender.address.getPort(), message.from.getPort());
+            var tos = false;
+            var it: Io.net.cmsg.Iterator = .{ .control = @alignCast(message.control) };
+            while (it.next()) |cm| {
+                if (cm.header.level == std.posix.IPPROTO.IP and (cm.header.type == std.posix.IP.TOS or cm.header.type == std.posix.IP.RECVTOS)) tos = true;
+            }
+            try std.testing.expect(tos);
+            seen += 1;
+        }
+    }
 }
 
 test "io: receiveManyTimeout stops when the data buffer is full" {

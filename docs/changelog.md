@@ -15,6 +15,12 @@ All notable changes to this project will be documented in this file.
   waits up to 40ms for the peer's delayed ACK. `Socket.setNoDelay(false)` turns it back
   on, and the new `Socket.getNoDelay` reports the setting.
 
+- `Socket.sendMany` now sends datagrams in batches with `sendmmsg` on Linux, FreeBSD
+  and NetBSD, instead of one `sendmsg` and event loop round trip per datagram.
+
+- Spawning and finishing a task no longer updates a counter shared by all executors,
+  which slowed down spawn-heavy programs on many cores.
+
 ### Added
 
 - Added `local_address` to `IpAddress.ConnectOptions`, to connect from a specific local
@@ -30,6 +36,9 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- `std.Io` `sendManyTimeout` lost the count of messages already sent when it timed out or
+  was canceled, and restarted the timeout for each message.
+
 - An `AutoCancel` or `withTimeout` deadline that passed just after the operation finished
   no longer fails the task's next operation with `error.Canceled`.
 
@@ -38,6 +47,12 @@ All notable changes to this project will be documented in this file.
 
 - Under sustained load, tasks that overflowed an executor's run queue could wait until the
   load dropped, stalling some connections for seconds.
+
+- The io_uring backend ignored every send flag except `no_signal`, so a flag such as `oob`
+  or `eor` had no effect.
+
+- With pinned scheduling, tasks that overflowed a busy executor's run queue were taken back
+  one per poll, so with many busy connections some waited hundreds of milliseconds.
 
 - `File.sync` on macOS now uses `F_FULLFSYNC`, so synced data is flushed out of the
   drive's write cache too, as on other systems. It falls back to `fsync` on filesystems
@@ -99,6 +114,9 @@ fixes continue on the `zig-0.16` branch.
 
 - Socket, file and rename operations report more specific errors in many cases that used
   to be `error.Unexpected`.
+
+- On FreeBSD, batched UDP sends and receives used the wrong declarations for `sendmmsg` and
+  `recvmmsg`, which only worked by chance on little-endian systems.
 
 - The built-in DNS resolver now resolves `localhost` without querying DNS, and reports
   canonical names from `/etc/hosts` like glibc.

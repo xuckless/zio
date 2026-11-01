@@ -20,6 +20,7 @@ const NetSendTo = @import("../completion.zig").NetSendTo;
 const NetRecvMsg = @import("../completion.zig").NetRecvMsg;
 const NetRecvMmsg = @import("../completion.zig").NetRecvMmsg;
 const NetSendMsg = @import("../completion.zig").NetSendMsg;
+const NetSendMmsg = @import("../completion.zig").NetSendMmsg;
 const NetPoll = @import("../completion.zig").NetPoll;
 const NetSendFile = @import("../completion.zig").NetSendFile;
 const FileRead = @import("../completion.zig").FileRead;
@@ -236,6 +237,7 @@ pub fn capability(comptime op: Op) Support {
         .net_recvmsg,
         .net_recvmmsg,
         .net_sendmsg,
+        .net_sendmmsg,
         .net_poll,
         .net_shutdown,
         .net_close,
@@ -301,6 +303,11 @@ pub const NetRecvMsgData = struct {
 pub const NetSendMsgData = struct {
     msg: windows.WSAMSG_const = undefined,
     control_buf: windows.WSABUF_nullable = undefined,
+};
+
+pub const NetSendMmsgData = struct {
+    send: NetSendMsgData = .{},
+    iov: net.iovec_const = undefined,
 };
 
 pub const NetSendFileData = struct {
@@ -413,6 +420,17 @@ pub const NetShutdownError = error{
 const Self = @This();
 
 const log = @import("../../common.zig").log;
+
+/// A socket operation refused at submission. What the peer or the network
+/// did (a reset, an abort, an unreachable host) is the operation's result,
+/// returned to the caller like any other, and logged at debug only, as on
+/// the other backends; anything else is logged at err.
+fn logSubmitError(comptime what: []const u8, err: windows.WinsockError) void {
+    switch (err) {
+        .ECONNRESET, .ECONNABORTED, .ECONNREFUSED, .ENETRESET, .ENETDOWN, .ENETUNREACH, .EHOSTUNREACH, .ENOTCONN, .ESHUTDOWN, .ETIMEDOUT, .EDISCON => log.debug(what ++ " failed: {}", .{err}),
+        else => log.err(what ++ " failed: {}", .{err}),
+    }
+}
 
 allocator: std.mem.Allocator,
 shared_state: *SharedState,
@@ -675,10 +693,16 @@ pub fn submit(self: *Self, state: *LoopState, comptime op: Op, c: *Completion) v
 
         .net_sendmsg => {
             const data = c.cast(NetSendMsg);
-            self.submitSendMsg(state, data) catch |err| {
-                c.setError(err);
-                state.markCompletedFromBackend(c);
-            };
+            self.submitSendMsg(state, c, &data.internal, data.handle, data.data.iovecs, data.flags, data.addr, data.addr_len, data.control);
+        },
+
+        // No sendmmsg here: the first slot goes out on its own and the result
+        // reports one message.
+        .net_sendmmsg => {
+            const data = c.cast(NetSendMmsg);
+            const slot = &data.slots[0];
+            data.internal.iov = net.iovecConstFromSlice(slot.data);
+            self.submitSendMsg(state, c, &data.internal.send, data.handle, (&data.internal.iov)[0..1], data.flags, slot.addr, slot.addr_len, slot.control);
         },
 
         .net_poll => {
@@ -958,7 +982,7 @@ fn submitPoll(self: *Self, state: *LoopState, data: *NetPoll) !void {
         }
         if (err != .IO_PENDING) {
             // Real error - complete immediately with error
-            log.err("WSARecv/WSASend (poll) failed: {}", .{err});
+            logSubmitError("WSARecv/WSASend (poll)", err);
             data.c.setError(net.errnoToRecvError(err));
             state.markCompletedFromBackend(&data.c);
             return;
@@ -1008,7 +1032,7 @@ fn submitRecv(self: *Self, state: *LoopState, data: *NetRecv) !void {
         // failed submission, so its completion packet still follows.
         if (err != .IO_PENDING and err != .EMSGSIZE) {
             // Real error - complete immediately with error
-            log.err("WSARecv failed: {}", .{err});
+            logSubmitError("WSARecv", err);
             data.c.setError(net.errnoToRecvError(err));
             state.markCompletedFromBackend(&data.c);
             return;
@@ -1044,7 +1068,7 @@ fn submitSend(self: *Self, state: *LoopState, data: *NetSend) !void {
         const err = windows.WSAGetLastError();
         if (err != .IO_PENDING) {
             // Real error - complete immediately with error
-            log.err("WSASend failed: {}", .{err});
+            logSubmitError("WSASend", err);
             data.c.setError(net.errnoToSendError(err));
             state.markCompletedFromBackend(&data.c);
             return;
@@ -1096,7 +1120,7 @@ fn submitRecvFrom(self: *Self, state: *LoopState, data: *NetRecvFrom) !void {
         // failed submission, so its completion packet still follows.
         if (err != .IO_PENDING and err != .EMSGSIZE) {
             // Real error - complete immediately with error
-            log.err("WSARecvFrom failed: {}", .{err});
+            logSubmitError("WSARecvFrom", err);
             data.c.setError(net.errnoToRecvError(err));
             state.markCompletedFromBackend(&data.c);
             return;
@@ -1134,7 +1158,7 @@ fn submitSendTo(self: *Self, state: *LoopState, data: *NetSendTo) !void {
         const err = windows.WSAGetLastError();
         if (err != .IO_PENDING) {
             // Real error - complete immediately with error
-            log.err("WSASendTo failed: {}", .{err});
+            logSubmitError("WSASendTo", err);
             data.c.setError(net.errnoToSendError(err));
             state.markCompletedFromBackend(&data.c);
             return;
@@ -1205,7 +1229,7 @@ fn submitRecvMsg(self: *Self, state: *LoopState, data: *NetRecvMsg) !void {
         // WSAEMSGSIZE is a truncated datagram that was delivered, not a
         // failed submission, so its completion packet still follows.
         if (err != .IO_PENDING and err != .EMSGSIZE) {
-            log.err("WSARecvMsg failed: {}", .{err});
+            logSubmitError("WSARecvMsg", err);
             data.c.setError(net.errnoToRecvError(err));
             state.markCompletedFromBackend(&data.c);
             return;
@@ -1214,51 +1238,62 @@ fn submitRecvMsg(self: *Self, state: *LoopState, data: *NetRecvMsg) !void {
     // Operation will complete via IOCP (either immediate or async)
 }
 
-fn submitSendMsg(self: *Self, state: *LoopState, data: *NetSendMsg) !void {
+fn submitSendMsg(
+    self: *Self,
+    state: *LoopState,
+    c: *Completion,
+    internal: *NetSendMsgData,
+    handle: NetHandle,
+    iovecs: []const net.iovec_const,
+    flags: net.SendFlags,
+    addr: ?*const net.sockaddr,
+    addr_len: net.socklen_t,
+    control: ?[]const u8,
+) void {
     // Initialize OVERLAPPED
-    data.c.internal.overlapped = std.mem.zeroes(windows.OVERLAPPED);
+    c.internal.overlapped = std.mem.zeroes(windows.OVERLAPPED);
 
     // Set up control buffer if provided
-    if (data.control) |ctl| {
-        data.internal.control_buf = .{
+    if (control) |ctl| {
+        internal.control_buf = .{
             .len = @intCast(ctl.len),
             .buf = @constCast(ctl.ptr),
         };
     } else {
-        data.internal.control_buf = .{
+        internal.control_buf = .{
             .len = 0,
             .buf = null,
         };
     }
 
     // Initialize WSAMSG_const
-    data.internal.msg = .{
-        .name = if (data.addr) |addr| @ptrCast(addr) else null,
-        .namelen = if (data.addr != null) @intCast(data.addr_len) else 0,
-        .lpBuffers = @constCast(data.data.iovecs.ptr),
-        .dwBufferCount = @intCast(data.data.iovecs.len),
-        .Control = data.internal.control_buf,
-        .dwFlags = sendFlagsToMsg(data.flags),
+    internal.msg = .{
+        .name = if (addr) |a| @ptrCast(a) else null,
+        .namelen = if (addr != null) @intCast(addr_len) else 0,
+        .lpBuffers = @constCast(iovecs.ptr),
+        .dwBufferCount = @intCast(iovecs.len),
+        .Control = internal.control_buf,
+        .dwFlags = sendFlagsToMsg(flags),
     };
 
     // Load WSASendMsg extension function
     const exts = self.shared_state.exts;
 
     const result = exts.wsasendmsg(
-        data.handle,
-        &data.internal.msg,
-        sendFlagsToMsg(data.flags),
-        &data.c.internal.bytes,
-        &data.c.internal.overlapped,
+        handle,
+        &internal.msg,
+        sendFlagsToMsg(flags),
+        &c.internal.bytes,
+        &c.internal.overlapped,
         null, // No completion routine
     );
 
     if (result == windows.SOCKET_ERROR) {
         const err = windows.WSAGetLastError();
         if (err != .IO_PENDING) {
-            log.err("WSASendMsg failed: {}", .{err});
-            data.c.setError(net.errnoToSendError(err));
-            state.markCompletedFromBackend(&data.c);
+            logSubmitError("WSASendMsg", err);
+            c.setError(net.errnoToSendError(err));
+            state.markCompletedFromBackend(c);
             return;
         }
     }
@@ -1327,7 +1362,7 @@ fn armNetSendFile(self: *Self, data: *NetSendFile) !bool {
     if (result == windows.FALSE) {
         const err = windows.WSAGetLastError();
         if (err != .IO_PENDING) {
-            log.err("TransmitFile failed: {}", .{err});
+            logSubmitError("TransmitFile", err);
             return net.errnoToSendError(err);
         }
     }
@@ -1352,11 +1387,6 @@ fn bindWildcard(handle: windows.SOCKET, family: u16) !void {
         addr.port = 0;
         addr.addr = @splat(0); // IN6ADDR_ANY
         bind_addr_len = @sizeOf(windows.sockaddr.in6);
-    } else if (family == windows.AF.UNIX) {
-        const addr: *windows.sockaddr.un = @ptrCast(&bind_addr_buf);
-        addr.family = windows.AF.UNIX;
-        addr.path = @splat(0); // Empty path for wildcard bind
-        bind_addr_len = @sizeOf(windows.sockaddr.un);
     } else {
         return error.Unexpected;
     }
@@ -1364,9 +1394,51 @@ fn bindWildcard(handle: windows.SOCKET, family: u16) !void {
     try net.bind(handle, @ptrCast(&bind_addr_buf), bind_addr_len);
 }
 
+/// Connects an AF_UNIX socket with a plain connect() and completes the op
+/// inline. ConnectEx is not used for AF_UNIX: it needs a bound socket, and the
+/// only "wildcard" name AF_UNIX has is the all-NUL one, which Windows takes as
+/// an abstract address (unsupported on current Windows: the bind succeeds,
+/// connections over it fail); ConnectEx after that bind was seen failing with
+/// WSAEFAULT. .NET ("ConnectEx supports connection-oriented sockets but not
+/// UDS", Socket.Windows.cs) and Go (ConnectEx for tcp only, net/fd_windows.go)
+/// connect AF_UNIX sockets with connect() too. A local connect is answered at
+/// once (the listener's backlog takes it or refuses it); should a nonblocking
+/// socket still report WSAEWOULDBLOCK, this waits with WSAPoll, as the poll
+/// backend does.
+fn connectUnix(data: *NetConnect) void {
+    net.connect(data.handle, data.addr, data.addr_len) catch |err| switch (err) {
+        error.WouldBlock, error.ConnectionPending => {
+            var pfd = [1]net.pollfd{.{ .fd = data.handle, .events = net.POLL.OUT, .revents = 0 }};
+            _ = net.poll(&pfd, -1) catch |poll_err| {
+                data.c.setError(poll_err);
+                return;
+            };
+            const sock_err = net.getSockError(data.handle) catch |get_err| {
+                data.c.setError(get_err);
+                return;
+            };
+            if (sock_err != 0) {
+                data.c.setError(net.errnoToConnectError(@fromBackingInt(@intCast(sock_err))));
+                return;
+            }
+        },
+        else => {
+            data.c.setError(err);
+            return;
+        },
+    };
+    data.c.setResult(.net_connect, {});
+}
+
 fn submitConnect(self: *Self, state: *LoopState, data: *NetConnect) !void {
     // Get address family from the target address
     const family: u16 = @as(*const windows.sockaddr, @ptrCast(@alignCast(data.addr))).family;
+
+    if (family == windows.AF.UNIX) {
+        connectUnix(data);
+        state.markCompletedFromBackend(&data.c);
+        return;
+    }
 
     // Load ConnectEx extension function for this address family
     const exts = self.shared_state.exts;
@@ -1399,7 +1471,7 @@ fn submitConnect(self: *Self, state: *LoopState, data: *NetConnect) !void {
         const err = windows.WSAGetLastError();
         if (err != .IO_PENDING) {
             // Real error - complete immediately with error
-            log.err("ConnectEx failed: {}", .{err});
+            logSubmitError("ConnectEx", err);
             data.c.setError(net.errnoToConnectError(err));
             state.markCompletedFromBackend(&data.c);
             return;
@@ -1692,6 +1764,7 @@ pub fn cancel(self: *Self, state: *LoopState, target: *Completion) void {
                 .net_recvmsg,
                 .net_recvmmsg,
                 .net_sendmsg,
+                .net_sendmmsg,
                 .net_poll,
                 .net_send_file,
                 => blk: {
@@ -1706,6 +1779,7 @@ pub fn cancel(self: *Self, state: *LoopState, target: *Completion) void {
                         .net_recvmsg => target.cast(NetRecvMsg).handle,
                         .net_recvmmsg => target.cast(NetRecvMmsg).handle,
                         .net_sendmsg => target.cast(NetSendMsg).handle,
+                        .net_sendmmsg => target.cast(NetSendMmsg).handle,
                         .net_poll => target.cast(NetPoll).handle,
                         .net_send_file => target.cast(NetSendFile).handle,
                         else => unreachable,
@@ -2113,6 +2187,30 @@ fn processCompletion(self: *Self, state: *LoopState, entry: *const windows.OVERL
                 c.setError(net.errnoToSendError(err));
             } else {
                 c.setResult(.net_sendmsg, @intCast(bytes_transferred));
+            }
+
+            state.markCompletedFromBackend(c);
+        },
+
+        .net_sendmmsg => {
+            const data = c.cast(NetSendMmsg);
+            var bytes_transferred: windows.DWORD = 0;
+            var flags: windows.DWORD = 0;
+
+            const result = windows.WSAGetOverlappedResult(
+                data.handle,
+                &data.c.internal.overlapped,
+                &bytes_transferred,
+                windows.FALSE,
+                &flags,
+            );
+
+            if (result == windows.FALSE) {
+                const err = windows.WSAGetLastError();
+                c.setError(net.errnoToSendError(err));
+            } else {
+                data.slots[0].sent_len = bytes_transferred;
+                c.setResult(.net_sendmmsg, 1);
             }
 
             state.markCompletedFromBackend(c);

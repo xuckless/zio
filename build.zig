@@ -15,6 +15,10 @@ pub fn build(b: *std.Build) void {
     const no_hacks = b.option(bool, "no-hacks", "Avoid unsafe performance tricks (bool smuggling, etc.)");
     const scheduler_metrics = b.option(bool, "scheduler_metrics", "Count scheduler events (parks, steals, wake batches) in per-executor counters readable via Runtime.schedulerMetrics (default true)");
     const debug_cancel = b.option(bool, "debug_cancel", "Report tasks that keep running after swallowing error.Canceled, with stack traces (default false)");
+    const debug_held_locks = b.option(bool, "debug_held_locks", "Panic when a task suspends while it holds a lock counted through zio.held_locks (default false)");
+    const fast_accept = b.option(bool, "fast_accept", "Accept connections waiting in the backlog directly, and size the accept and spawn backpressure budgets to the run queue (default false)");
+
+    const diagnostics = b.option(bool, "diagnostics", "Count tasks and expose run-queue and stack gauges via Runtime.executorStats (default false)");
 
     const build_options: BuildOptions = .{
         .backend = backend,
@@ -23,6 +27,9 @@ pub fn build(b: *std.Build) void {
         .no_hacks = no_hacks orelse false,
         .scheduler_metrics = scheduler_metrics orelse true,
         .debug_cancel = debug_cancel orelse false,
+        .debug_held_locks = debug_held_locks orelse false,
+        .fast_accept = fast_accept orelse false,
+        .diagnostics = diagnostics orelse false,
     };
 
     const zio = b.addModule("zio", .{
@@ -138,6 +145,9 @@ const BuildOptions = struct {
     no_hacks: bool,
     scheduler_metrics: bool,
     debug_cancel: bool,
+    debug_held_locks: bool,
+    fast_accept: bool,
+    diagnostics: bool,
 
     // Enums are passed as tag names and mapped back to zio's own types in
     // src/options.zig.
@@ -149,6 +159,9 @@ const BuildOptions = struct {
         options.addOption(bool, "no_hacks", self.no_hacks);
         options.addOption(bool, "scheduler_metrics", self.scheduler_metrics);
         options.addOption(bool, "debug_cancel", self.debug_cancel);
+        options.addOption(bool, "debug_held_locks", self.debug_held_locks);
+        options.addOption(bool, "fast_accept", self.fast_accept);
+        options.addOption(bool, "diagnostics", self.diagnostics);
         return options;
     }
 };

@@ -325,6 +325,30 @@ pub fn stackRecycle(info: StackInfo) void {
     posix.madvise(addr[0..committed_size], posix.MADV.FREE) catch {};
 }
 
+/// Whether `stackTrim` gives pages back on this target: Linux, on the
+/// architectures whose saved stack pointer the executor reads.
+pub const can_trim = builtin.os.tag == .linux and switch (builtin.cpu.arch) {
+    .x86_64, .aarch64 => true,
+    else => false,
+};
+
+/// Drops the pages of `info`'s committed region that lie wholly below `sp`
+/// (less the x86_64 red zone), on a stack whose coroutine is suspended with
+/// `sp` saved: what its deeper calls touched and returned from. The region
+/// stays committed, and the next touch maps a zeroed page, so this costs
+/// nothing in correctness, only the refault. MADV_DONTNEED, so the memory
+/// is returned at once rather than under pressure (MADV_FREE). A no-op
+/// where `can_trim` is false.
+pub fn stackTrim(info: StackInfo, sp: usize) void {
+    if (comptime !can_trim) return;
+    const red_zone = 128;
+    if (sp < info.limit + red_zone) return;
+    const end = std.mem.alignBackward(usize, sp - red_zone, pageSize());
+    if (end <= info.limit) return;
+    const addr: [*]align(page_size) u8 = @ptrFromInt(info.limit);
+    posix.madvise(addr[0 .. end - info.limit], posix.MADV.DONTNEED) catch {};
+}
+
 pub const StackExtendMode = enum {
     /// Grow by 1.5x the current committed size (default incremental growth)
     grow,
