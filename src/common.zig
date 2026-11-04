@@ -660,8 +660,8 @@ fn waitForIoImpl(c: *ev.Completion, comptime cancel_check: CancelCheck) Cancelab
     // queue, so the wait below parks until the executor drains it, and that
     // park is its yield point. A completion finished on another loop's thread
     // (one that owns the socket) can signal before the wait, which then
-    // returns without parking; charge the coop budget for that case so it
-    // still hits a yield point.
+    // returns without parking; that case still hits a yield point
+    // (yieldPointNoPark).
     const signaled_early = waiter.mode.direct.notify.state.load(.acquire) != 0;
     waiter.wait(1, .allow_cancel) catch |err| switch (err) {
         error.Canceled => {
@@ -680,9 +680,33 @@ fn waitForIoImpl(c: *ev.Completion, comptime cancel_check: CancelCheck) Cancelab
             return;
         },
     };
-    if (signaled_early) {
-        task.getExecutor().maybeYield(.reschedule, .no_cancel);
-    }
+    if (signaled_early) yieldPointNoPark(task);
+}
+
+/// The yield point of a wait that ended without parking: an operation that
+/// completed at once (a direct send, see `sendNow` in io.zig) or a waiter
+/// signaled before it could park. A park is a task's yield point, so a task
+/// whose I/O keeps completing at once (a socket that always takes the write,
+/// one that always has data) would otherwise run without bound, holding back
+/// the executor's other tasks, its timers and I/O poll, the stall watchdog's
+/// heartbeat and quiescent-state passes. Spends one quantum of the tick
+/// budget and yields to the back of the run queue once the tick is spent,
+/// as a park would have; within the tick it returns at once (as Seastar's
+/// `maybe_yield` and Tokio's coop budget, which a ready I/O resource still
+/// charges). Not a cancelation point: the caller has a result to return,
+/// and a pending cancel is delivered at the next one. Checks held locks as
+/// a park does (`Options.debug_held_locks`), so a lock held across I/O is
+/// caught whether or not the operation completed at once.
+///
+/// Only for a task outside a no-suspend region (`getWaitableTaskOrNull`),
+/// after its operation returned; never from inside the loop. A loop that
+/// works without any zio wait in between (a reader over buffered frames, a
+/// multi-batch UDP drain) calls the public `maybeYield()` per batch instead.
+/// If ticks prove too coarse for fairness beside busy uploads, yielding
+/// earlier when the run queue is non-empty belongs here (not built).
+pub inline fn yieldPointNoPark(task: *AnyTask) void {
+    @import("held_locks.zig").checkSuspend();
+    task.getExecutor().maybeYield(.reschedule, .no_cancel);
 }
 
 /// Runs an I/O operation to completion without allowing cancellation.
@@ -712,9 +736,7 @@ pub fn waitForIoUncancelable(c: *ev.Completion) void {
     // See waitForIo.
     const signaled_early = waiter.mode.direct.notify.state.load(.acquire) != 0;
     waiter.wait(1, .no_cancel);
-    if (signaled_early) {
-        task.getExecutor().maybeYield(.reschedule, .no_cancel);
-    }
+    if (signaled_early) yieldPointNoPark(task);
 }
 
 /// Runs an I/O operation to completion with a timeout.

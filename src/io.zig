@@ -2922,17 +2922,17 @@ fn netWriteOpImpl(
 /// (epoll and kqueue send inside the submission), and on io_uring it waits
 /// for the next ring enter as well. With nothing else to bound it, a task
 /// whose writes always complete at once would never give up the executor,
-/// so each one spends a quantum of the tick budget (`maybeYield`, like the
-/// coop budget Tokio charges a ready I/O operation).
+/// so each one goes through `common.yieldPointNoPark`: a quantum of the tick
+/// budget (like the coop budget Tokio charges a ready I/O operation) and the
+/// held-lock check a park would have made.
 ///
 /// One writer per socket at a time: the same task's previous write either
 /// completed here or was waited for, so no send of its own is in flight on
 /// the socket. Not on Windows (IOCP sends complete through the loop).
 noinline fn sendNow(handle: Io.net.Socket.Handle, iovecs: []const os_net.iovec_const) ?(ev.NetSend.Error!usize) {
     if (!zio_options.fast_send or builtin.os.tag == .windows) return null;
-    const exec = runtime_mod.getCurrentExecutorOrNull() orelse return null;
-    // Not in a no-suspend region, where `maybeYield` could suspend (see
-    // `acceptNow`).
+    // Not in a no-suspend region, where the yield point could suspend (see
+    // `acceptNow`); null without an executor too.
     const task = runtime_mod.getWaitableTaskOrNull() orelse return null;
     // A pending cancel goes to the loop path, which reports it. Checking
     // consumes it, so it is put back (see `acceptNow`).
@@ -2944,7 +2944,7 @@ noinline fn sendNow(handle: Io.net.Socket.Handle, iovecs: []const os_net.iovec_c
         error.WouldBlock => return null,
         else => |e| return e,
     };
-    exec.maybeYield(.reschedule, .no_cancel);
+    common.yieldPointNoPark(task);
     return n;
 }
 
@@ -4124,8 +4124,11 @@ test "io: net TCP inline writes still yield at the tick budget" {
             while (w.writes < n_writes) : (w.writes += 1) {
                 try std.testing.expectEqual(1, try testNetWriteOnce(io, pair.client, "x"));
             }
+            // Within one tick: each write spends a quantum, and a tick has at
+            // most `max_tick_budget` of them before the writer yields and
+            // the woken task, queued ahead of it, runs.
             const seen = w.seen orelse return error.TestUnexpectedResult;
-            try std.testing.expect(seen < n_writes);
+            try std.testing.expect(seen <= runtime_mod.Executor.max_tick_budget);
             try future.await(io);
 
             try pair.client.shutdown(io, .send);

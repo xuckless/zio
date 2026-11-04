@@ -1799,10 +1799,14 @@ pub fn yield() Cancelable!void {
     return task.yieldFrom(exec, .reschedule, .allow_cancel);
 }
 
-/// Cooperatively yield, but only if enough other tasks are waiting (a cheap
-/// fairness check for long CPU-bound loops that would otherwise hog the
-/// executor). Returns error.Canceled if the task was canceled. No-op if called
-/// from a thread without an executor.
+/// Spend one quantum of the executor's tick budget (about 100 µs of task
+/// time) and, once it is spent, yield to the back of the run queue so the
+/// other tasks, timers and the I/O poll run; within the tick, return at once.
+/// A time-slice check: it doesn't look at the queues. For loops that work
+/// without any zio wait in between (CPU-bound work, a reader over buffered
+/// frames, a multi-batch drain): call it once per item or batch. Returns
+/// error.Canceled if the task was canceled (checked on every call). No-op if
+/// called from a thread without an executor.
 pub fn maybeYield() Cancelable!void {
     const exec = getCurrentExecutorOrNull() orelse return;
     return exec.maybeYield(.reschedule, .allow_cancel);
