@@ -141,3 +141,32 @@ jobs:
       timeout-minutes: 10
       env:
         TEST_VERBOSE: 2
+
+  # fast_send and fast_accept are compile-time options, off by default; the
+  # direct send and accept paths (and the inline-write fairness test) only
+  # run when built with them.
+  fast-paths:
+    strategy:
+      fail-fast: false
+      matrix:
+        zig_version: ['0.17.0']
+        backend: [epoll, io_uring]
+
+    runs-on: ubuntu-24.04
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup Zig
+      uses: mlugg/setup-zig@v2
+      with:
+        version: ${{ matrix.zig_version }}
+
+    - name: Build and test
+      shell: bash
+      run: |
+        ./check.sh --full --backend ${{ matrix.backend }} --fast-send --fast-accept
+      timeout-minutes: 10
+      env:
+        TEST_VERBOSE: 2

@@ -4073,9 +4073,12 @@ test "io: net TCP write with a cancel pending reports Canceled" {
 }
 
 test "io: net TCP inline writes still yield at the tick budget" {
-    // Writes that complete at once never park; each spends a quantum of the
-    // tick budget, so a task that only writes still lets another one run
-    // before it finishes. More writes than `Executor.max_tick_budget`.
+    // With fast_send, writes that complete at once never park; each spends a
+    // quantum of the tick budget, so a task that only writes still lets
+    // another one run before it finishes. More writes than
+    // `Executor.max_tick_budget`. Without fast_send every write parks, so
+    // the bound would hold without the yield: skip rather than pass.
+    if (!zio_options.fast_send or builtin.os.tag == .windows) return error.SkipZigTest;
     const rt = try Runtime.init(std.testing.allocator, .{ .executors = .exact(1) });
     defer rt.deinit();
 
