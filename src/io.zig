@@ -2250,7 +2250,9 @@ const min_accept_burst = 128;
 fn acceptNow(server: Io.net.Socket.Handle, peer_addr: *zio_net.Address, peer_addr_len: *os_net.socklen_t) ?ev.Backend.NetHandle {
     if (!zio_options.fast_accept or builtin.os.tag == .windows) return null;
     const exec = runtime_mod.getCurrentExecutorOrNull() orelse return null;
-    const task = runtime_mod.getCurrentTaskOrNull() orelse return null;
+    // Not in a no-suspend region: the yield below would suspend there. The
+    // loop path then blocks the thread, as every wait in a region does.
+    const task = runtime_mod.getWaitableTaskOrNull() orelse return null;
     if (accept_burst >= exec.roundBudget(min_accept_burst)) {
         accept_burst = 0;
         // The cancel check below reports a cancel that lands meanwhile.
@@ -2929,7 +2931,9 @@ fn netWriteOpImpl(
 noinline fn sendNow(handle: Io.net.Socket.Handle, iovecs: []const os_net.iovec_const) ?(ev.NetSend.Error!usize) {
     if (!zio_options.fast_send or builtin.os.tag == .windows) return null;
     const exec = runtime_mod.getCurrentExecutorOrNull() orelse return null;
-    const task = runtime_mod.getCurrentTaskOrNull() orelse return null;
+    // Not in a no-suspend region, where `maybeYield` could suspend (see
+    // `acceptNow`).
+    const task = runtime_mod.getWaitableTaskOrNull() orelse return null;
     // A pending cancel goes to the loop path, which reports it. Checking
     // consumes it, so it is put back (see `acceptNow`).
     task.checkCancel() catch {
@@ -3933,6 +3937,39 @@ test "io: net TCP write that fits completes without a park" {
     try handle.join();
 }
 
+test "io: net TCP write in a no-suspend region doesn't suspend" {
+    const rt = try Runtime.init(std.testing.allocator, .{ .executors = .exact(1) });
+    defer rt.deinit();
+
+    const Worker = struct {
+        fn other(ran: *bool) void {
+            ran.* = true;
+        }
+
+        fn run(r: *Runtime, io: Io) !void {
+            var pair: TestTcpPair = try .open(io);
+            defer pair.close(io);
+
+            var ran = false;
+            var other_task = try r.spawn(other, .{&ran});
+            defer other_task.join();
+
+            // A spent tick budget makes a direct send yield, which inside the
+            // region would run `other` before the write returns.
+            const exec = runtime_mod.getCurrentExecutor();
+            exec.tick_expired = true;
+            runtime_mod.beginNoSuspend();
+            const n = testNetWriteOnce(io, pair.client, "x");
+            runtime_mod.endNoSuspend();
+            try std.testing.expectEqual(1, try n);
+            try std.testing.expect(!ran);
+        }
+    };
+
+    var handle = try rt.spawn(Worker.run, .{ rt, rt.io() });
+    try handle.join();
+}
+
 test "io: net TCP short direct write returns its count and the rest waits" {
     const rt = try Runtime.init(std.testing.allocator, .{});
     defer rt.deinit();
@@ -3992,7 +4029,7 @@ test "io: net TCP short direct write returns its count and the rest waits" {
             // for the rest.
             const first = try testNetWriteOnce(io, pair.client, data);
             try std.testing.expect(first > 0);
-            if (zio_options.fast_send) try std.testing.expect(first < len);
+            if (zio_options.fast_send and builtin.os.tag != .windows) try std.testing.expect(first < len);
 
             var send_buf: [4096]u8 = undefined;
             var writer = pair.client.writer(io, &send_buf);
