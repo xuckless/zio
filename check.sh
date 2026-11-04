@@ -19,13 +19,14 @@ COVERAGE=false
 TIMEOUT=""
 NO_LOG_CAPTURE=false
 FAST_ACCEPT=false
+FAST_SEND=false
 DEBUG_CANCEL=false
 DIAGNOSTICS=false
 QUIESCENT_STATE=false
 
 # Parse arguments
 usage() {
-  echo "Usage: $0 [--filter \"test name\"] [--target <target>] [--backend <backend>] [--scheduling <mode>] [--wine] [--qemu] [--no-exec] [--coverage] [--ci] [--full] [--release] [--fast-accept] [--debug-cancel] [--diagnostics] [--quiescent-state] [--verbose] [--no-log-capture] [--timeout <seconds>]"
+  echo "Usage: $0 [--filter \"test name\"] [--target <target>] [--backend <backend>] [--scheduling <mode>] [--wine] [--qemu] [--no-exec] [--coverage] [--ci] [--full] [--release] [--fast-accept] [--fast-send] [--debug-cancel] [--diagnostics] [--quiescent-state] [--verbose] [--no-log-capture] [--timeout <seconds>]"
 }
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -89,6 +90,10 @@ while [[ $# -gt 0 ]]; do
             FAST_ACCEPT=true
             shift
             ;;
+        --fast-send)
+            FAST_SEND=true
+            shift
+            ;;
         --debug-cancel)
             DEBUG_CANCEL=true
             shift
@@ -145,6 +150,10 @@ fi
 if [ "$FAST_ACCEPT" = true ]; then
     echo "Fast accept: on"
     BUILD_ARGS+=("-Dfast_accept=true")
+fi
+if [ "$FAST_SEND" = true ]; then
+    echo "Fast send: on"
+    BUILD_ARGS+=("-Dfast_send=true")
 fi
 if [ "$DEBUG_CANCEL" = true ]; then
     echo "Debug cancel: on"

@@ -17,6 +17,7 @@ pub fn build(b: *std.Build) void {
     const debug_cancel = b.option(bool, "debug_cancel", "Report tasks that keep running after swallowing error.Canceled, with stack traces (default false)");
     const debug_held_locks = b.option(bool, "debug_held_locks", "Panic when a task suspends while it holds a lock counted through zio.held_locks (default false)");
     const fast_accept = b.option(bool, "fast_accept", "Accept connections waiting in the backlog directly, and size the accept and spawn backpressure budgets to the run queue (default false)");
+    const fast_send = b.option(bool, "fast_send", "Send on a stream socket directly before submitting the write to the event loop, so a write the socket takes at once doesn't park the task (default false)");
 
     const quiescent_state = b.option(bool, "quiescent_state", "Keep a quiescent-state counter per executor for Runtime.quiescentSnapshot/quiescentPassed (QSBR reclamation; default false)");
     const diagnostics = b.option(bool, "diagnostics", "Count tasks and expose run-queue and stack gauges via Runtime.executorStats; in Debug and test builds also keep a live-task list for zio.dumpTasks and run the executor stall watchdog (default false)");
@@ -30,6 +31,7 @@ pub fn build(b: *std.Build) void {
         .debug_cancel = debug_cancel orelse false,
         .debug_held_locks = debug_held_locks orelse false,
         .fast_accept = fast_accept orelse false,
+        .fast_send = fast_send orelse false,
         .diagnostics = diagnostics orelse false,
         .quiescent_state = quiescent_state orelse false,
     };
@@ -162,6 +164,7 @@ const BuildOptions = struct {
     debug_cancel: bool,
     debug_held_locks: bool,
     fast_accept: bool,
+    fast_send: bool,
     diagnostics: bool,
     quiescent_state: bool,
 
@@ -177,6 +180,7 @@ const BuildOptions = struct {
         options.addOption(bool, "debug_cancel", self.debug_cancel);
         options.addOption(bool, "debug_held_locks", self.debug_held_locks);
         options.addOption(bool, "fast_accept", self.fast_accept);
+        options.addOption(bool, "fast_send", self.fast_send);
         options.addOption(bool, "diagnostics", self.diagnostics);
         options.addOption(bool, "quiescent_state", self.quiescent_state);
         return options;

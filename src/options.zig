@@ -88,6 +88,14 @@ pub const Options = struct {
     /// connection per pass over its run queue. Off by default, as in
     /// lalinsky/zio#837; Anole turns it on.
     fast_accept: bool = build_options.fast_accept,
+    /// Let a write on a stream socket (the std.Io `net_write` operation) try
+    /// a nonblocking send first and return what the socket took, without a
+    /// trip through the event loop. The loop path runs only when the socket
+    /// is full (or a cancel is pending). Without it, a write parks the task
+    /// even when it completes at once, and on io_uring waits for the next
+    /// submission. A short count is returned as is; the caller sends the
+    /// rest. Off by default, keeping zio as upstream; Anole turns it on.
+    fast_send: bool = build_options.fast_send,
     /// Count tasks spawned and finished per executor (one relaxed atomic add
     /// each) and expose them, the run-queue length and the stack pool's use
     /// through `Runtime.executorStats`. Off by default: the counters and the

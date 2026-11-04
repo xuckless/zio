@@ -2901,9 +2901,47 @@ fn netWriteOpImpl(
     var iovecs: [max_iovecs_len]os_net.iovec_const = undefined;
     const wbuf = ev.WriteBuf.fromSlices(slices[0..n], &iovecs);
 
+    if (sendNow(handle, wbuf.iovecs)) |r| return r catch |err| return sendErrToWriteErr(err);
+
     var op = ev.NetSend.init(stdIoHandleToZio(handle), wbuf, .{});
     try timedWaitForIoClock(&op.c, timeout, clock);
     return op.getResult() catch |err| return sendErrToWriteErr(err);
+}
+
+/// With `fast_send` (otherwise null at once): send what a stream socket takes
+/// now, with a nonblocking send() before the write is submitted to the loop,
+/// as Go's netpoll, Netty and Seastar's io_uring backend
+/// (`reactor_backend_uring::sendmsg`) do. Null when the loop path must run:
+/// no task, a cancel pending, or the socket full (WouldBlock). A short count
+/// is returned as is; the caller (`Io.Writer.drain`) sends the rest, which
+/// then normally finds the socket full and waits.
+///
+/// Through the loop, a write parks the task even when it completes at once
+/// (epoll and kqueue send inside the submission), and on io_uring it waits
+/// for the next ring enter as well. With nothing else to bound it, a task
+/// whose writes always complete at once would never give up the executor,
+/// so each one spends a quantum of the tick budget (`maybeYield`, like the
+/// coop budget Tokio charges a ready I/O operation).
+///
+/// One writer per socket at a time: the same task's previous write either
+/// completed here or was waited for, so no send of its own is in flight on
+/// the socket. Not on Windows (IOCP sends complete through the loop).
+noinline fn sendNow(handle: Io.net.Socket.Handle, iovecs: []const os_net.iovec_const) ?(ev.NetSend.Error!usize) {
+    if (!zio_options.fast_send or builtin.os.tag == .windows) return null;
+    const exec = runtime_mod.getCurrentExecutorOrNull() orelse return null;
+    const task = runtime_mod.getCurrentTaskOrNull() orelse return null;
+    // A pending cancel goes to the loop path, which reports it. Checking
+    // consumes it, so it is put back (see `acceptNow`).
+    task.checkCancel() catch {
+        task.recancel();
+        return null;
+    };
+    const n = os_net.send(stdIoHandleToZio(handle), iovecs, .{ .dontwait = true }) catch |err| switch (err) {
+        error.WouldBlock => return null,
+        else => |e| return e,
+    };
+    exec.maybeYield(.reschedule, .no_cancel);
+    return n;
 }
 
 fn netWriteFileImpl(
@@ -3825,6 +3863,241 @@ test "io: net TCP read/write/shutdown round-trip" {
     };
 
     var handle = try rt.spawn(Worker.run, .{rt.io()});
+    try handle.join();
+}
+
+/// One `net_write` operation, as `Io.net.Stream.Writer.drain` makes it.
+fn testNetWriteOnce(io: Io, stream: Io.net.Stream, bytes: []const u8) !usize {
+    const result = try io.operate(.{ .net_write = .{ .socket_handle = stream.socket.handle, .data = &.{bytes} } });
+    return result.net_write;
+}
+
+/// A loopback TCP pair made from one task: `client` connected to `peer`.
+const TestTcpPair = struct {
+    server: Io.net.Server,
+    client: Io.net.Stream,
+    peer: Io.net.Stream,
+
+    fn open(io: Io) !TestTcpPair {
+        var server = try Io.net.IpAddress.listen(&.{ .ip4 = .loopback(0) }, io, .{ .reuse_address = true });
+        errdefer server.deinit(io);
+        const client = try Io.net.IpAddress.connect(&server.socket.address, io, .{ .mode = .stream });
+        errdefer client.close(io);
+        const peer = try server.accept(io);
+        return .{ .server = server, .client = client, .peer = peer };
+    }
+
+    fn close(self: *TestTcpPair, io: Io) void {
+        self.peer.close(io);
+        self.client.close(io);
+        self.server.deinit(io);
+    }
+};
+
+test "io: net TCP write that fits completes without a park" {
+    if (!runtime_mod.metrics_enabled) return error.SkipZigTest;
+    const rt = try Runtime.init(std.testing.allocator, .{ .executors = .exact(1) });
+    defer rt.deinit();
+
+    const Worker = struct {
+        fn run(r: *Runtime, io: Io) !void {
+            var pair: TestTcpPair = try .open(io);
+            defer pair.close(io);
+
+            var msg: [1024]u8 = undefined;
+            for (&msg, 0..) |*b, i| b.* = @truncate(i);
+
+            var send_buf: [4096]u8 = undefined;
+            var writer = pair.client.writer(io, &send_buf);
+            const before = r.schedulerMetrics();
+            try writer.interface.writeAll(&msg);
+            try writer.interface.flush();
+            const after = r.schedulerMetrics();
+            // Through the loop the write is a completion the executor wakes
+            // the task for; sent directly, nothing to wake.
+            if (zio_options.fast_send and builtin.os.tag != .windows) {
+                try std.testing.expectEqual(0, after.drain_woken - before.drain_woken);
+            } else {
+                try std.testing.expect(after.drain_woken - before.drain_woken >= 1);
+            }
+
+            var recv_buf: [256]u8 = undefined;
+            var reader = pair.peer.reader(io, &recv_buf);
+            var got: [1024]u8 = undefined;
+            try reader.interface.readSliceAll(&got);
+            try std.testing.expectEqualSlices(u8, &msg, &got);
+        }
+    };
+
+    var handle = try rt.spawn(Worker.run, .{ rt, rt.io() });
+    try handle.join();
+}
+
+test "io: net TCP short direct write returns its count and the rest waits" {
+    const rt = try Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+
+    const len = 8 * 1024 * 1024;
+    const Worker = struct {
+        fn byteAt(i: usize) u8 {
+            return @truncate(i *% 7 +% (i >> 13));
+        }
+
+        /// Reads to the end (a mismatch doesn't stop it, so the writer
+        /// never waits on a reader that left).
+        fn receive(io: Io, peer: Io.net.Stream, received: *usize) !void {
+            var recv_buf: [16 * 1024]u8 = undefined;
+            var reader = peer.reader(io, &recv_buf);
+            var in_order = true;
+            while (true) {
+                const chunk = reader.interface.peekGreedy(1) catch |err| switch (err) {
+                    error.EndOfStream => break,
+                    else => |e| return e,
+                };
+                for (chunk, received.*..) |b, i| {
+                    if (b != byteAt(i)) in_order = false;
+                }
+                received.* += chunk.len;
+                reader.interface.toss(chunk.len);
+            }
+            if (!in_order) return error.TestUnexpectedResult;
+        }
+
+        fn run(io: Io) !void {
+            var pair: TestTcpPair = try .open(io);
+            defer pair.close(io);
+            // Socket buffers set on both ends (which also stops the kernel
+            // growing them) and far under 8 MiB, so it can't go in one send.
+            // Not under the loopback MSS (64 KiB), or the receive window
+            // shrinks to nothing between reads and TCP falls back to its
+            // persist timer.
+            const small: c_int = 256 * 1024;
+            try os_net.setsockopt(stdIoHandleToZio(pair.client.socket.handle), os_net.SOL.SOCKET, os_net.SO.SNDBUF, std.mem.asBytes(&small));
+            try os_net.setsockopt(stdIoHandleToZio(pair.peer.socket.handle), os_net.SOL.SOCKET, os_net.SO.RCVBUF, std.mem.asBytes(&small));
+
+            const data = try std.testing.allocator.alloc(u8, len);
+            defer std.testing.allocator.free(data);
+            for (data, 0..) |*b, i| b.* = byteAt(i);
+
+            var received: usize = 0;
+            var receive_result: anyerror!void = {};
+            var future = io.async(struct {
+                fn call(io2: Io, peer: Io.net.Stream, n: *usize, out: *anyerror!void) void {
+                    out.* = receive(io2, peer, n);
+                }
+            }.call, .{ io, pair.peer, &received, &receive_result });
+            defer future.cancel(io);
+
+            // The first write sends what fits and says so; it doesn't wait
+            // for the rest.
+            const first = try testNetWriteOnce(io, pair.client, data);
+            try std.testing.expect(first > 0);
+            if (zio_options.fast_send) try std.testing.expect(first < len);
+
+            var send_buf: [4096]u8 = undefined;
+            var writer = pair.client.writer(io, &send_buf);
+            try writer.interface.writeAll(data[first..]);
+            try writer.interface.flush();
+            try pair.client.shutdown(io, .send);
+
+            future.await(io);
+            try receive_result;
+            try std.testing.expectEqual(len, received);
+        }
+    };
+
+    var handle = try rt.spawn(Worker.run, .{rt.io()});
+    try handle.join();
+}
+
+test "io: net TCP write with a cancel pending reports Canceled" {
+    const rt = try Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+
+    const Worker = struct {
+        fn run(io: Io) !void {
+            var pair: TestTcpPair = try .open(io);
+            defer pair.close(io);
+
+            // The socket would take the byte at once; the cancel comes first.
+            _ = runtime_mod.getCurrentTask().setCanceled(.user);
+            try std.testing.expectError(error.Canceled, testNetWriteOnce(io, pair.client, "x"));
+
+            // Reported once, so the task goes on; nothing was sent.
+            try pair.client.shutdown(io, .send);
+            var recv_buf: [16]u8 = undefined;
+            var reader = pair.peer.reader(io, &recv_buf);
+            try std.testing.expectError(error.EndOfStream, reader.interface.peekByte());
+        }
+    };
+
+    var handle = try rt.spawn(Worker.run, .{rt.io()});
+    try handle.join();
+}
+
+test "io: net TCP inline writes still yield at the tick budget" {
+    // Writes that complete at once never park; each spends a quantum of the
+    // tick budget, so a task that only writes still lets another one run
+    // before it finishes. More writes than `Executor.max_tick_budget`.
+    const rt = try Runtime.init(std.testing.allocator, .{ .executors = .exact(1) });
+    defer rt.deinit();
+
+    const Event = @import("sync/Event.zig");
+    const n_writes = 20_000;
+
+    const Worker = struct {
+        event: Event = .init,
+        writes: usize = 0,
+        /// `writes` when the other task ran.
+        seen: ?usize = null,
+
+        fn other(w: *@This()) !void {
+            try w.event.wait();
+            w.seen = w.writes;
+        }
+
+        /// Drains the peer, so the writes never wait for room for long
+        /// (one-byte segments fill the socket buffers fast).
+        fn receive(io: Io, peer: Io.net.Stream) !usize {
+            var recv_buf: [4096]u8 = undefined;
+            var reader = peer.reader(io, &recv_buf);
+            var total: usize = 0;
+            while (true) {
+                const chunk = reader.interface.peekGreedy(1) catch |err| switch (err) {
+                    error.EndOfStream => return total,
+                    else => |e| return e,
+                };
+                total += chunk.len;
+                reader.interface.toss(chunk.len);
+            }
+        }
+
+        fn run(w: *@This(), io: Io) !void {
+            var pair: TestTcpPair = try .open(io);
+            defer pair.close(io);
+
+            var receiver = try io.concurrent(receive, .{ io, pair.peer });
+            defer _ = receiver.cancel(io) catch {};
+            var future = try io.concurrent(other, .{w});
+            defer future.cancel(io) catch {};
+            // Let it run up to its wait.
+            try runtime_mod.yield();
+
+            w.event.set();
+            while (w.writes < n_writes) : (w.writes += 1) {
+                try std.testing.expectEqual(1, try testNetWriteOnce(io, pair.client, "x"));
+            }
+            const seen = w.seen orelse return error.TestUnexpectedResult;
+            try std.testing.expect(seen < n_writes);
+            try future.await(io);
+
+            try pair.client.shutdown(io, .send);
+            try std.testing.expectEqual(n_writes, try receiver.await(io));
+        }
+    };
+
+    var w: Worker = .{};
+    var handle = try rt.spawn(Worker.run, .{ &w, rt.io() });
     try handle.join();
 }
 
