@@ -1401,13 +1401,6 @@ pub const Loop = struct {
         self.state.markCompleted(&op.c);
     }
 
-    /// Process one batch of events: expire timers, poll the backend for
-    /// completions, run callbacks. `wait_cap` bounds how long the backend poll
-    /// may block: `.zero` never blocks (and skips the poll syscall entirely
-    /// when nothing is in flight), `.max` waits for the next event, anything
-    /// in between caps the wait at that duration.
-    /// Timer deadlines, pending completions, and the loop's `max_wait` option
-    /// can all shorten the wait; they never lengthen it.
     /// Time spent asleep in the backend's waiting syscall since `init`, or
     /// null when the backend doesn't measure it. io_uring doesn't: its waiting
     /// enter also submits and runs task_work (and their softirq), so its wall
@@ -1420,6 +1413,13 @@ pub const Loop = struct {
         };
     }
 
+    /// Process one batch of events: expire timers, poll the backend for
+    /// completions, run callbacks. `wait_cap` bounds how long the backend poll
+    /// may block: `.zero` never blocks (and skips the poll syscall entirely
+    /// when nothing is in flight), `.max` waits for the next event, anything
+    /// in between caps the wait at that duration.
+    /// Timer deadlines, pending completions, and the loop's `max_wait` option
+    /// can all shorten the wait; they never lengthen it.
     pub fn poll(self: *Loop, wait_cap: Duration) !void {
         std.debug.assert(self.state.initialized);
         if (self.done()) return;
