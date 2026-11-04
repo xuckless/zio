@@ -511,6 +511,11 @@ pub const Loop = struct {
     /// group-owner callbacks are unaffected (they still run inline).
     do_not_call_callbacks: bool = false,
 
+    /// Nanoseconds spent inside the backend's waiting syscall (a poll with a
+    /// non-zero timeout), libuv's `uv_metrics_idle_time`. Bumped by the epoll
+    /// and kqueue backends only, on the owner thread; read it with `idleNs`.
+    idle_ns: u64 = 0,
+
     const default_queue_size = 256;
 
     pub const Options = struct {
@@ -1394,6 +1399,18 @@ pub const Loop = struct {
     fn netSendFileFinish(self: *Loop, op: *NetSendFile, err: ?anyerror) void {
         if (err) |e| op.c.setError(e) else op.c.setResult(.net_send_file, op.fallback.total);
         self.state.markCompleted(&op.c);
+    }
+
+    /// Time spent asleep in the backend's waiting syscall since `init`, or
+    /// null when the backend doesn't measure it. io_uring doesn't: its waiting
+    /// enter also submits and runs task_work (and their softirq), so its wall
+    /// time isn't idle time. Owner thread only.
+    pub fn idleNs(self: *const Loop) ?u64 {
+        return switch (@import("backend.zig").backend) {
+            .epoll, .kqueue => self.idle_ns,
+            .linux => if (self.backend.engine == .epoll) self.idle_ns else null,
+            .poll, .io_uring, .iocp => null,
+        };
     }
 
     /// Process one batch of events: expire timers, poll the backend for

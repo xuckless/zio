@@ -2564,6 +2564,15 @@ pub const Runtime = struct {
         return exec.id;
     }
 
+    /// Nanoseconds the calling executor's loop has slept in its waiting poll
+    /// syscall (`ev.Loop.idleNs`), or null when the thread is not one of this
+    /// runtime's executors or the backend doesn't measure it (io_uring).
+    pub fn currentLoopIdleNs(self: *Runtime) ?u64 {
+        const exec = getCurrentExecutorOrNull() orelse return null;
+        if (exec.runtime != self) return null;
+        return exec.loop.idleNs();
+    }
+
     /// Recover the `*Runtime` from a `std.Io` produced by `Runtime.io()`
     /// or `Runtime.blockingIo()`, or null when it is backed by some other
     /// implementation.

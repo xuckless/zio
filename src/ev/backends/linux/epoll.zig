@@ -763,7 +763,13 @@ pub fn poll(self: *Self, state: *LoopState, timeout: Duration) !bool {
     // Reset pending changes counter before poll (less aggressive)
     self.pending_changes = 0;
 
-    const n = try self.waitEvents(timeout);
+    // Time a poll that may sleep as idle (libuv's uv_metrics_idle_time
+    // bracket); a zero-timeout poll is work.
+    const n = if (timeout.value == 0) try self.waitEvents(timeout) else blk: {
+        const start = time.now(.awake);
+        defer state.loop.idle_ns +%= @intCast(start.durationTo(time.now(.awake)).toNanoseconds());
+        break :blk try self.waitEvents(timeout);
+    };
 
     if (n == 0) {
         return true; // Timed out

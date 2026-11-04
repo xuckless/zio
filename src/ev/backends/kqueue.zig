@@ -5,6 +5,7 @@ const net = @import("../../os/net.zig");
 const time = @import("../../os/time.zig");
 const Duration = @import("../../time.zig").Duration;
 const Clock = @import("../../time.zig").Clock;
+const Timestamp = @import("../../time.zig").Timestamp;
 const common = @import("common.zig");
 
 const unexpectedError = @import("../../os/base.zig").unexpectedError;
@@ -744,6 +745,9 @@ pub fn poll(self: *Self, state: *LoopState, timeout: Duration) !bool {
     } else null;
 
     const changes = self.change_buffer.items;
+    // Time a poll that may sleep as idle (libuv's uv_metrics_idle_time
+    // bracket); a zero-timeout poll is work.
+    const idle_start: ?Timestamp = if (timeout.value == 0) null else time.now(.awake);
     const rc = std.c.kevent(
         self.kqueue_fd,
         changes.ptr,
@@ -752,6 +756,7 @@ pub fn poll(self: *Self, state: *LoopState, timeout: Duration) !bool {
         @intCast(self.events.len),
         timeout_ptr,
     );
+    if (idle_start) |start| state.loop.idle_ns +%= @intCast(start.durationTo(time.now(.awake)).toNanoseconds());
     const n: usize = switch (posix.errno(rc)) {
         .SUCCESS => @intCast(rc),
         .INTR => 0, // Interrupted by signal, no events
