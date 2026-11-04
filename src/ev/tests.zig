@@ -80,6 +80,48 @@ test "Loop: timer basic" {
     std.log.info("timer: expected={}ms, actual={f}", .{ timeout_ms, elapsed });
 }
 
+test "Loop: idle_ns counts a poll that waited, not a zero-timeout poll" {
+    const backend = @import("backend.zig").backend;
+    switch (backend) {
+        .linux, .epoll, .kqueue => {},
+        else => return error.SkipZigTest,
+    }
+
+    // Force epoll under auto mode: the group's first loop picks the engine.
+    var group: @import("loop.zig").LoopGroup = .{};
+    if (backend == .linux) group.shared.selection = .epoll;
+
+    var loop: Loop = undefined;
+    try loop.init(.{ .loop_group = &group });
+    defer loop.deinit();
+
+    const start = loop.idleNs().?;
+    try loop.poll(.zero);
+    try std.testing.expectEqual(start, loop.idleNs().?);
+
+    var timer: Timer = .init(.{ .duration = .fromMilliseconds(5) });
+    loop.add(&timer.c);
+    try loop.run();
+    try std.testing.expectEqual(.dead, timer.c.loadState().phase);
+    try std.testing.expect(loop.idleNs().? > start);
+
+    const after = loop.idleNs().?;
+    try loop.poll(.zero);
+    try std.testing.expectEqual(after, loop.idleNs().?);
+}
+
+test "Loop: idleNs is null on io_uring" {
+    const backend = @import("backend.zig").backend;
+    if (backend != .linux and backend != .io_uring) return error.SkipZigTest;
+
+    var loop: Loop = undefined;
+    try loop.init(.{});
+    defer loop.deinit();
+
+    if (backend == .linux and loop.backend.engine != .io_uring) return error.SkipZigTest;
+    try std.testing.expectEqual(null, loop.idleNs());
+}
+
 test "Loop: close" {
     var loop: Loop = undefined;
     try loop.init(.{});
