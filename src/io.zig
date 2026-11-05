@@ -3954,10 +3954,12 @@ test "io: net TCP write in a no-suspend region doesn't suspend" {
             var other_task = try r.spawn(other, .{&ran});
             defer other_task.join();
 
-            // A spent tick budget makes a direct send yield, which inside the
-            // region would run `other` before the write returns.
+            // A spent tick with the grace used up makes a direct send yield,
+            // which inside the region would run `other` before the write
+            // returns.
             const exec = runtime_mod.getCurrentExecutor();
             exec.tick_expired = true;
+            exec.no_park_overrun = runtime_mod.Executor.no_park_grace - 1;
             runtime_mod.beginNoSuspend();
             const n = testNetWriteOnce(io, pair.client, "x");
             runtime_mod.endNoSuspend();
