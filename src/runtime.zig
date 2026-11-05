@@ -581,6 +581,12 @@ pub const Executor = struct {
     // exhausted budget, while tick_task_count stays truthful for the EWMA.
     tick_expired: bool = false,
 
+    // Operations completed without parking (no-park yield points) since the
+    // tick budget ran out; reset with the tick. Counted per executor, but
+    // once the tick is spent no other task is popped until the running one
+    // parks or yields, so it is the running task's count (yieldIfOverrun).
+    no_park_overrun: u32 = 0,
+
     // Quanta left until the next clock checkpoint (cheaper than a modulo on
     // the hot path).
     tick_checkpoint_countdown: u32 = checkpoint_interval,
@@ -853,6 +859,10 @@ pub const Executor = struct {
     /// mispredictions. Prime (like Go's 61) to avoid resonating with periodic
     /// workloads; also tokio's max tasks per global-queue interval.
     const checkpoint_interval = 127;
+    /// How many operations a task may complete without parking past a spent
+    /// tick before it yields (yieldIfOverrun). Netty's default for the same
+    /// job (writeSpinCount, maxMessagesPerRead); Tokio's per-poll budget is 128.
+    pub const no_park_grace = 16;
 
     /// How long the rescue baton holder parks at most, and the minimum time
     /// between its rescue scans (see park). A task stuck behind a running
@@ -893,6 +903,22 @@ pub const Executor = struct {
         if (!self.tickBudgetLeft()) {
             return getCurrentTask().yield(mode, cancel_mode);
         }
+    }
+
+    /// The no-park yield point's budget check (common.yieldPointNoPark).
+    /// Spends a quantum like maybeYield, but a spent tick alone doesn't
+    /// yield: the running task usually parks on its next operation, and that
+    /// park ends the tick without sending it behind every ready task (Tokio
+    /// charges its coop budget per task poll, not per tick). It yields once
+    /// it has completed no_park_grace operations past the tick without
+    /// parking. After that yield the tick is spent, so the executor polls
+    /// and resets the count before it runs anything else.
+    pub fn yieldIfOverrun(self: *Executor) void {
+        self.spendQuantum();
+        if (self.tickBudgetLeft()) return;
+        self.no_park_overrun += 1;
+        if (self.no_park_overrun < no_park_grace) return;
+        getCurrentTask().yield(.reschedule, .no_cancel);
     }
 
     pub const RunMode = enum {
@@ -1007,6 +1033,7 @@ pub const Executor = struct {
             self.tick_started_at = tick_now;
             self.tick_task_count = 0;
             self.tick_expired = false;
+            self.no_park_overrun = 0;
             self.tick_checkpoint_countdown = checkpoint_interval;
             if (need_fresh_drain) {
                 need_fresh_drain = false;
@@ -2956,6 +2983,82 @@ test "runtime: maybeYield yields once the tick budget is spent" {
     try std.testing.expectEqual(task_count, counter);
     try group.wait();
     try std.testing.expect(!group.hasFailed());
+}
+
+test "runtime: a no-park yield point past a spent tick yields only after the grace" {
+    // #184: the task running when the tick runs out has usually completed one
+    // operation (a direct send) and parks on its next; a yield there would
+    // send it behind every ready task. It yields only after no_park_grace
+    // operations past the tick without parking.
+    const runtime = try Runtime.init(std.testing.allocator, .{ .executors = .exact(1) });
+    defer runtime.deinit();
+
+    const Event = @import("sync/Event.zig");
+
+    const Worker = struct {
+        event: Event = .init,
+        ran: bool = false,
+
+        fn other(w: *@This()) !void {
+            try w.event.wait();
+            w.ran = true;
+        }
+
+        fn run(w: *@This(), r: *Runtime) !void {
+            var other_task = try r.spawn(other, .{w});
+            defer other_task.cancel();
+            // Let it run up to its wait, then make it runnable.
+            try yield();
+            w.event.set();
+
+            const exec = getCurrentExecutor();
+            try std.testing.expectEqual(0, exec.no_park_overrun);
+            exec.tick_expired = true;
+            const task = getCurrentTask();
+            for (0..Executor.no_park_grace - 1) |_| common.yieldPointNoPark(task);
+            try std.testing.expect(!w.ran);
+            try std.testing.expectEqual(Executor.no_park_grace - 1, exec.no_park_overrun);
+
+            // The last one yields: the executor polls, resets the tick and
+            // runs the other task, queued ahead of this one.
+            common.yieldPointNoPark(task);
+            try std.testing.expect(w.ran);
+            try std.testing.expectEqual(0, getCurrentExecutor().no_park_overrun);
+            try other_task.join();
+        }
+    };
+
+    var w: Worker = .{};
+    var handle = try runtime.spawn(Worker.run, .{ &w, runtime });
+    try handle.join();
+}
+
+test "runtime: a no-park yield point past a spent tick yields after the grace with nothing else runnable" {
+    // The yield past the grace is what lets the executor poll I/O and timers
+    // for a task that never parks, so it happens with an empty run queue too.
+    const runtime = try Runtime.init(std.testing.allocator, .{ .executors = .exact(1) });
+    defer runtime.deinit();
+
+    const Worker = struct {
+        fn run() !void {
+            const exec = getCurrentExecutor();
+            exec.tick_expired = true;
+            const task = getCurrentTask();
+            for (0..Executor.no_park_grace - 1) |_| common.yieldPointNoPark(task);
+            // Not yielded yet: the tick is still the spent one.
+            try std.testing.expect(exec.tick_expired);
+            try std.testing.expectEqual(Executor.no_park_grace - 1, exec.no_park_overrun);
+
+            common.yieldPointNoPark(task);
+            // Yielded: the executor polled and this task runs in a fresh tick.
+            const after = getCurrentExecutor();
+            try std.testing.expect(!after.tick_expired);
+            try std.testing.expectEqual(0, after.no_park_overrun);
+        }
+    };
+
+    var handle = try runtime.spawn(Worker.run, .{});
+    try handle.join();
 }
 
 test "runtime: sleep from main allows tasks to run" {

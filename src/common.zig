@@ -690,10 +690,13 @@ fn waitForIoImpl(c: *ev.Completion, comptime cancel_check: CancelCheck) Cancelab
 /// one that always has data) would otherwise run without bound, holding back
 /// the executor's other tasks, its timers and I/O poll, the stall watchdog's
 /// heartbeat and quiescent-state passes. Spends one quantum of the tick
-/// budget and yields to the back of the run queue once the tick is spent,
-/// as a park would have; within the tick it returns at once (as Seastar's
-/// `maybe_yield` and Tokio's coop budget, which a ready I/O resource still
-/// charges). Not a cancelation point: the caller has a result to return,
+/// budget; within the tick it returns at once (as Seastar's `maybe_yield`
+/// and Tokio's coop budget, which a ready I/O resource still charges). Past
+/// a spent tick it yields to the back of the run queue only after
+/// `Executor.no_park_grace` more such operations without a park
+/// (`Executor.yieldIfOverrun`): the task at the tick boundary has usually
+/// done one and parks on its next, and yielding it there would cost it a
+/// whole extra pass of the run queue at saturation (#184). Not a cancelation point: the caller has a result to return,
 /// and a pending cancel is delivered at the next one. Checks held locks as
 /// a park does (`Options.debug_held_locks`), so a lock held across I/O is
 /// caught whether or not the operation completed at once.
@@ -702,11 +705,9 @@ fn waitForIoImpl(c: *ev.Completion, comptime cancel_check: CancelCheck) Cancelab
 /// after its operation returned; never from inside the loop. A loop that
 /// works without any zio wait in between (a reader over buffered frames, a
 /// multi-batch UDP drain) calls the public `maybeYield()` per batch instead.
-/// If ticks prove too coarse for fairness beside busy uploads, yielding
-/// earlier when the run queue is non-empty belongs here (not built).
 pub inline fn yieldPointNoPark(task: *AnyTask) void {
     @import("held_locks.zig").checkSuspend();
-    task.getExecutor().maybeYield(.reschedule, .no_cancel);
+    task.getExecutor().yieldIfOverrun();
 }
 
 /// Runs an I/O operation to completion without allowing cancellation.

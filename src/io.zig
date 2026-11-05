@@ -4128,10 +4128,11 @@ test "io: net TCP inline writes still yield at the tick budget" {
                 try std.testing.expectEqual(1, try testNetWriteOnce(io, pair.client, "x"));
             }
             // Within one tick: each write spends a quantum, and a tick has at
-            // most `max_tick_budget` of them before the writer yields and
-            // the woken task, queued ahead of it, runs.
+            // most `max_tick_budget` of them; past it the writer may complete
+            // `no_park_grace` more without parking before it yields and the
+            // woken task, queued ahead of it, runs.
             const seen = w.seen orelse return error.TestUnexpectedResult;
-            try std.testing.expect(seen <= runtime_mod.Executor.max_tick_budget);
+            try std.testing.expect(seen <= runtime_mod.Executor.max_tick_budget + runtime_mod.Executor.no_park_grace);
             try future.await(io);
 
             try pair.client.shutdown(io, .send);
