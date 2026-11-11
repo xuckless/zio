@@ -94,7 +94,10 @@ pub const Options = struct {
     /// is full (or a cancel is pending). Without it, a write parks the task
     /// even when it completes at once, and on io_uring waits for the next
     /// submission. A short count is returned as is; the caller sends the
-    /// rest. Off by default, keeping zio as upstream; Anole turns it on.
+    /// rest. On io_uring a batch of datagrams (`net_send` with several
+    /// messages) likewise tries sendmmsg first and goes through the ring
+    /// only when the socket is full. Off by default, keeping zio as
+    /// upstream; Anole turns it on.
     fast_send: bool = build_options.fast_send,
     /// Count tasks spawned and finished per executor (one relaxed atomic add
     /// each) and expose them, the run-queue length and the stack pool's use

@@ -5890,7 +5890,9 @@ test "io: sendManyTimeout and receiveManyTimeout carry several datagrams with co
     const one: c_int = 1;
     try std.testing.expectEqual(@as(c_int, 0), std.c.setsockopt(receiver.handle, std.posix.IPPROTO.IP, std.posix.IP.RECVTOS, @ptrCast(&one), @sizeOf(c_int)));
 
-    const payloads = [_][]const u8{ "one", "two", "three", "four", "five" };
+    // More than one batch of 8: on io_uring the batches after a full one are
+    // received directly, and still carry each datagram's control message.
+    const payloads = [_][]const u8{ "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten", "eleven", "twelve", "thirteen", "fourteen", "fifteen", "sixteen", "seventeen", "eighteen", "nineteen", "twenty" };
     var out: [payloads.len]Io.net.OutgoingMessage = undefined;
     for (&out, payloads) |*m, p| m.* = .{ .address = &receiver.address, .data_ptr = p.ptr, .data_len = p.len };
     const send_err, const sent = sender.sendManyTimeout(io, &out, .{}, .none);
@@ -5911,8 +5913,9 @@ test "io: sendManyTimeout and receiveManyTimeout carry several datagrams with co
         const err, const n = receiver.receiveManyTimeout(io, &messages, &buf, .{}, timeout);
         try std.testing.expectEqual(null, err);
         try std.testing.expect(n > 0);
-        // Linux loopback delivery finishes inside send: one call has them all.
-        if (builtin.os.tag == .linux) try std.testing.expectEqual(payloads.len, n);
+        // Linux loopback delivery finishes inside send: every call fills
+        // its slots.
+        if (builtin.os.tag == .linux) try std.testing.expectEqual(@min(messages.len, payloads.len - seen), n);
         for (messages[0..n]) |*message| {
             try std.testing.expectEqualStrings(payloads[seen], message.data);
             try std.testing.expectEqual(sender.address.getPort(), message.from.getPort());
@@ -5925,6 +5928,76 @@ test "io: sendManyTimeout and receiveManyTimeout carry several datagrams with co
             seen += 1;
         }
     }
+}
+
+test "io: datagram batches received back to back still let another task run" {
+    // On io_uring a batch after a full one is received inside `loop.add`,
+    // without the ring; it still resumes through the dispatched queue, behind
+    // the tasks already ready, as on epoll.
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const rt = try Runtime.init(std.testing.allocator, .{ .executors = .exact(1) });
+    defer rt.deinit();
+
+    const Event = @import("sync/Event.zig");
+    const batch = 32;
+    const n_batches = 6;
+
+    const Worker = struct {
+        event: Event = .init,
+        batches: usize = 0,
+        /// `batches` when the other task ran.
+        seen: ?usize = null,
+
+        fn other(w: *@This()) !void {
+            try w.event.wait();
+            w.seen = w.batches;
+        }
+
+        fn receiveBatch(io: Io, receiver: Io.net.Socket) !void {
+            var messages: [batch]Io.net.IncomingMessage = @splat(.init);
+            var buf: [batch * 64]u8 = undefined;
+            const err, const n = receiver.receiveManyTimeout(io, &messages, &buf, .{}, .none);
+            try std.testing.expectEqual(null, err);
+            try std.testing.expectEqual(batch, n);
+        }
+
+        fn run(w: *@This(), io: Io) !void {
+            var sender = try Io.net.IpAddress.bind(&.{ .ip4 = .loopback(0) }, io, .{ .mode = .dgram });
+            defer sender.close(io);
+            var receiver = try Io.net.IpAddress.bind(&.{ .ip4 = .loopback(0) }, io, .{ .mode = .dgram });
+            defer receiver.close(io);
+            const rcvbuf: c_int = 1 << 20;
+            try os_net.setsockopt(stdIoHandleToZio(receiver.handle), os_net.SOL.SOCKET, os_net.SO.RCVBUF, std.mem.asBytes(&rcvbuf));
+
+            var out: [batch]Io.net.OutgoingMessage = undefined;
+            for (&out) |*m| m.* = .{ .address = &receiver.address, .data_ptr = "x", .data_len = 1 };
+            for (0..n_batches) |_| {
+                const send_err, const sent = sender.sendManyTimeout(io, &out, .{}, .none);
+                try std.testing.expectEqual(null, send_err);
+                try std.testing.expectEqual(batch, sent);
+            }
+
+            var future = try io.concurrent(other, .{w});
+            defer future.cancel(io) catch {};
+            // Let it run up to its wait.
+            try runtime_mod.yield();
+
+            // The first batch fills every slot, so on io_uring the rest skip
+            // the ring.
+            try receiveBatch(io, receiver);
+            w.batches = 1;
+            w.event.set();
+            while (w.batches < n_batches) : (w.batches += 1) try receiveBatch(io, receiver);
+
+            const seen = w.seen orelse return error.TestUnexpectedResult;
+            try std.testing.expect(seen <= 2);
+            try future.await(io);
+        }
+    };
+
+    var w: Worker = .{};
+    var handle = try rt.spawn(Worker.run, .{ &w, rt.io() });
+    try handle.join();
 }
 
 test "io: receiveManyTimeout stops when the data buffer is full" {

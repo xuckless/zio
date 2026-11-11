@@ -8,6 +8,8 @@ const NetOpen = @import("completion.zig").NetOpen;
 const NetBind = @import("completion.zig").NetBind;
 const NetRecvMsg = @import("completion.zig").NetRecvMsg;
 const NetSendTo = @import("completion.zig").NetSendTo;
+const NetRecvMmsg = @import("completion.zig").NetRecvMmsg;
+const NetSendMmsg = @import("completion.zig").NetSendMmsg;
 const NetPoll = @import("completion.zig").NetPoll;
 const Backend = @import("backend.zig").Backend;
 const PipePoll = @import("completion.zig").PipePoll;
@@ -546,4 +548,125 @@ test "Pipe: poll for readability" {
     var read_data: [128]u8 = undefined;
     const read_len = posix.system.read(pipefd[0], &read_data, read_data.len);
     try std.testing.expectEqual(write_data.len, @as(usize, @intCast(read_len)));
+}
+
+/// A loop on the io_uring engine, or null to skip: the tests below check
+/// what the io_uring backend does before it writes an SQE.
+fn initIoUringLoop(loop: *Loop) !bool {
+    const backend = @import("backend.zig").backend;
+    if (backend != .linux and backend != .io_uring) return false;
+    try loop.init(.{});
+    if (backend == .linux and loop.backend.engine != .io_uring) {
+        loop.deinit();
+        return false;
+    }
+    return true;
+}
+
+fn sendByte(fd: net.fd_t, byte: u8) !void {
+    const iov = [1]net.iovec_const{net.iovecConstFromSlice(&.{byte})};
+    _ = try net.sendmsg(fd, &iov, .{}, null, 0, null);
+}
+
+test "Loop: on io_uring a datagram batch that filled every slot lets the next one finish inside add" {
+    var loop: Loop = undefined;
+    if (!try initIoUringLoop(&loop)) return error.SkipZigTest;
+    defer loop.deinit();
+
+    // A connected AF_UNIX pair: a datagram is queued once send returns.
+    const pair = try net.socketpair(.unix, .dgram, .ip, .{ .nonblocking = true });
+    defer net.close(pair[0]);
+    defer net.close(pair[1]);
+
+    const batch = 8;
+    // Three full batches, then a short one.
+    const total = 3 * batch + 3;
+    for (0..total) |i| try sendByte(pair[0], @intCast(i));
+
+    var bufs: [batch][4]u8 = undefined;
+    var slots: [batch]NetRecvMmsg.Slot = undefined;
+    var next: usize = 0;
+    var round: usize = 0;
+    while (next < total) : (round += 1) {
+        for (&slots, &bufs) |*slot, *buf| slot.* = .{ .data = buf };
+        var recv: NetRecvMmsg = .init(pair[1], &slots, .{});
+        loop.add(&recv.c);
+        // The first batch goes through the ring; each one after a full batch
+        // is received inside add, before any poll.
+        const expected: @TypeOf(recv.c.loadState().phase) = if (round == 0) .running else .completed;
+        try std.testing.expectEqual(expected, recv.c.loadState().phase);
+        try loop.run();
+        const n = try recv.getResult();
+        try std.testing.expectEqual(@min(batch, total - next), n);
+        for (slots[0..n]) |slot| {
+            try std.testing.expectEqual(1, slot.received_len);
+            try std.testing.expectEqual(@as(u8, @intCast(next)), slot.data[0]);
+            next += 1;
+        }
+    }
+    try std.testing.expectEqual(4, round);
+
+    // The short batch dropped the hint: the next receive waits in the ring.
+    for (&slots, &bufs) |*slot, *buf| slot.* = .{ .data = buf };
+    var recv: NetRecvMmsg = .init(pair[1], &slots, .{});
+    loop.add(&recv.c);
+    try std.testing.expectEqual(.running, recv.c.loadState().phase);
+    try sendByte(pair[0], 0xAB);
+    try loop.run();
+    try std.testing.expectEqual(1, try recv.getResult());
+    try std.testing.expectEqual(0xAB, slots[0].data[0]);
+}
+
+test "Loop: on io_uring with fast_send a datagram batch is sent inside add, and waits in the ring when the socket is full" {
+    if (!@import("../options.zig").options.fast_send) return error.SkipZigTest;
+    var loop: Loop = undefined;
+    if (!try initIoUringLoop(&loop)) return error.SkipZigTest;
+    defer loop.deinit();
+
+    const pair = try net.socketpair(.unix, .dgram, .ip, .{ .nonblocking = true });
+    defer net.close(pair[0]);
+    defer net.close(pair[1]);
+
+    const payloads = [_][]const u8{ "a", "bb", "ccc" };
+    var slots: [payloads.len]NetSendMmsg.Slot = undefined;
+    for (&slots, payloads) |*slot, p| slot.* = .{ .data = p };
+    var send: NetSendMmsg = .init(pair[0], &slots, .{});
+    loop.add(&send.c);
+    try std.testing.expectEqual(.completed, send.c.loadState().phase);
+    try loop.run();
+    try std.testing.expectEqual(payloads.len, try send.getResult());
+    for (slots, payloads) |slot, p| try std.testing.expectEqual(p.len, slot.sent_len);
+
+    // Fill the sender's buffer: an AF_UNIX datagram is charged to it until
+    // the peer reads it.
+    const small: c_int = 4096;
+    try net.setsockopt(pair[0], net.SOL.SOCKET, net.SO.SNDBUF, std.mem.asBytes(&small));
+    var queued: usize = payloads.len;
+    while (true) : (queued += 1) {
+        sendByte(pair[0], 'x') catch |err| switch (err) {
+            error.WouldBlock => break,
+            else => return err,
+        };
+    }
+
+    // The direct try finds the socket full, so the batch waits in the ring.
+    var slot = [1]NetSendMmsg.Slot{.{ .data = "last" }};
+    var blocked: NetSendMmsg = .init(pair[0], &slot, .{});
+    loop.add(&blocked.c);
+    try std.testing.expectEqual(.running, blocked.c.loadState().phase);
+    try loop.poll(.zero);
+    try std.testing.expectEqual(.running, blocked.c.loadState().phase);
+
+    // The peer reads everything queued; the socket turns writable and the
+    // ring sends the batch.
+    var buf: [16]u8 = undefined;
+    for (0..queued) |_| {
+        var iov = [1]net.iovec{net.iovecFromSlice(&buf)};
+        _ = try net.recvmsg(pair[1], &iov, .{}, null, null, null);
+    }
+    try loop.run();
+    try std.testing.expectEqual(1, try blocked.getResult());
+    var iov = [1]net.iovec{net.iovecFromSlice(&buf)};
+    const last = try net.recvmsg(pair[1], &iov, .{}, null, null, null);
+    try std.testing.expectEqualStrings("last", buf[0..last.len]);
 }

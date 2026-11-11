@@ -8,6 +8,7 @@ const time = @import("../../../os/time.zig");
 const Duration = @import("../../../time.zig").Duration;
 const Clock = @import("../../../time.zig").Clock;
 const common = @import("../common.zig");
+const zio_options = @import("../../../options.zig").options;
 const LoopState = @import("../../loop.zig").LoopState;
 const Completion = @import("../../completion.zig").Completion;
 const Queue = @import("../../queue.zig").Queue;
@@ -308,16 +309,20 @@ const splice_no_offset: u64 = std.math.maxInt(u64);
 const SPLICE_F_MOVE: u32 = 1;
 const SPLICE_F_MORE: u32 = 4;
 
-/// Listening sockets whose last accept on this loop reported more connections
-/// waiting (IORING_CQE_F_SOCK_NONEMPTY, Linux 6.10+). An accept on one of them
-/// first tries accept(2) directly, so it can finish inside `add`; on an idle
-/// listener it costs nothing. The listener must be nonblocking, as the epoll
-/// backend's accept already requires. An entry is only a hint: another loop
-/// may have taken the connections, or the fd been closed on another loop and
-/// reused, which a failed direct accept clears. Open addressing by fd, with
-/// backward-shift deletion; a full table, likely holding such stale entries,
-/// is cleared.
-const AcceptHints = struct {
+/// Sockets whose last operation on this loop said more is waiting, so the
+/// next one first tries the syscall directly and can finish inside `add`; on
+/// an idle socket it costs nothing. Two tables use it:
+/// - `accept_hints`: listeners whose last accept reported more connections
+///   (IORING_CQE_F_SOCK_NONEMPTY, Linux 6.10+), tried with accept(2).
+/// - `recv_hints`: datagram sockets whose last batch receive filled every
+///   slot, tried with recvmmsg(2). A batch that comes back short drops it,
+///   so a socket the batches keep up with pays no extra EAGAIN.
+/// The socket must be nonblocking, as the epoll backend already requires.
+/// An entry is only a hint: another loop may have taken what was waiting, or
+/// the fd been closed on another loop and reused, which a failed direct try
+/// clears. Open addressing by fd, with backward-shift deletion; a full table,
+/// likely holding such stale entries, is cleared.
+const FdHints = struct {
     const size = 32;
     fds: [size]net.fd_t = @splat(-1),
 
@@ -325,7 +330,7 @@ const AcceptHints = struct {
         return @as(usize, @intCast(fd)) % size;
     }
 
-    fn find(self: *const AcceptHints, fd: net.fd_t) ?usize {
+    fn find(self: *const FdHints, fd: net.fd_t) ?usize {
         if (fd < 0) return null;
         var i = home(fd);
         for (0..size) |_| {
@@ -336,11 +341,11 @@ const AcceptHints = struct {
         return null;
     }
 
-    fn contains(self: *const AcceptHints, fd: net.fd_t) bool {
+    fn contains(self: *const FdHints, fd: net.fd_t) bool {
         return self.find(fd) != null;
     }
 
-    fn insert(self: *AcceptHints, fd: net.fd_t) void {
+    fn insert(self: *FdHints, fd: net.fd_t) void {
         if (fd < 0) return;
         for (0..2) |_| {
             var i = home(fd);
@@ -356,7 +361,7 @@ const AcceptHints = struct {
         }
     }
 
-    fn remove(self: *AcceptHints, fd: net.fd_t) void {
+    fn remove(self: *FdHints, fd: net.fd_t) void {
         var hole = self.find(fd) orelse return;
         var j = hole;
         while (true) {
@@ -376,8 +381,8 @@ const AcceptHints = struct {
     }
 };
 
-test "AcceptHints: insert, find and remove across collisions" {
-    var t: AcceptHints = .{};
+test "FdHints: insert, find and remove across collisions" {
+    var t: FdHints = .{};
     // 3, 35 and 67 share a home slot; 4 sits where 35 probes to.
     for ([_]net.fd_t{ 3, 35, 4, 67, 31, 63 }) |fd| t.insert(fd);
     for ([_]net.fd_t{ 3, 35, 4, 67, 31, 63 }) |fd| try std.testing.expect(t.contains(fd));
@@ -393,9 +398,9 @@ test "AcceptHints: insert, find and remove across collisions" {
     t.insert(-1);
     try std.testing.expect(!t.contains(-1));
     // Filling the table clears it for the next entry.
-    for (0..AcceptHints.size + 1) |i| t.insert(@intCast(100 + i));
+    for (0..FdHints.size + 1) |i| t.insert(@intCast(100 + i));
     try std.testing.expect(!t.contains(4));
-    try std.testing.expect(t.contains(100 + AcceptHints.size));
+    try std.testing.expect(t.contains(100 + FdHints.size));
 }
 
 const Self = @This();
@@ -430,7 +435,8 @@ shared_state: *SharedState,
 /// plain counter suffices. Read by hasInflight() to skip the enter syscall
 /// when nothing can arrive.
 inflight: usize = 0,
-accept_hints: AcceptHints = .{},
+accept_hints: FdHints = .{},
+recv_hints: FdHints = .{},
 
 pub fn init(self: *Self, allocator: std.mem.Allocator, queue_size: u16, shared_state: *SharedState) !void {
     var flags: u32 = 0;
@@ -753,6 +759,26 @@ fn submitInner(self: *Self, state: *LoopState, comptime op: Op, c: *Completion, 
         },
         .net_recvmmsg => {
             const data = c.cast(NetRecvMmsg);
+            if (self.recv_hints.contains(data.handle)) {
+                // The last batch filled every slot: read the next one
+                // directly, without a trip through the ring.
+                if (data.recvFromSlots()) |n| {
+                    c.setResult(.net_recvmmsg, n);
+                    self.updateRecvHint(data);
+                    state.markCompletedFromBackend(c);
+                    return;
+                } else |err| {
+                    self.recv_hints.remove(data.handle);
+                    // A datagram socket's pending error (an ICMP port
+                    // unreachable) is consumed by the call that reports
+                    // it, so it can't be left for the ring to see again.
+                    if (err != error.WouldBlock) {
+                        c.setError(err);
+                        state.markCompletedFromBackend(c);
+                        return;
+                    }
+                }
+            }
             data.internal.iov = net.iovecFromSlice(data.slots[0].data);
             data.internal.msg = .{
                 .name = @ptrCast(&data.slots[0].addr),
@@ -785,6 +811,23 @@ fn submitInner(self: *Self, state: *LoopState, comptime op: Op, c: *Completion, 
         },
         .net_sendmmsg => {
             const data = c.cast(NetSendMmsg);
+            if (zio_options.fast_send) {
+                // A datagram socket almost always has room: send without a
+                // trip through the ring. A short count is the op's contract
+                // (the caller re-submits the rest). When the socket is full,
+                // the SENDMSG below waits for it to take more.
+                var flags = data.flags;
+                flags.dontwait = true;
+                if (NetSendMmsg.sendSlots(data.handle, data.slots, flags)) |n| {
+                    c.setResult(.net_sendmmsg, n);
+                    state.markCompletedFromBackend(c);
+                    return;
+                } else |err| if (err != error.WouldBlock) {
+                    c.setError(err);
+                    state.markCompletedFromBackend(c);
+                    return;
+                }
+            }
             const slot = &data.slots[0];
             data.internal.iov = net.iovecConstFromSlice(slot.data);
             data.internal.msg = .{
@@ -819,6 +862,7 @@ fn submitInner(self: *Self, state: *LoopState, comptime op: Op, c: *Completion, 
         .net_close => {
             const data = c.cast(NetClose);
             self.accept_hints.remove(data.handle);
+            self.recv_hints.remove(data.handle);
             const sqe = self.getSqeOrDefer(c) orelse return;
             sqe.prep_close(data.handle);
             sqe.user_data = @intFromPtr(c);
@@ -1534,6 +1578,8 @@ pub fn poll(self: *Self, state: *LoopState, timeout: Duration) !bool {
             } else {
                 self.accept_hints.remove(handle);
             }
+        } else if (completion.op == .net_recvmmsg) {
+            self.updateRecvHint(completion.cast(NetRecvMmsg));
         }
 
         // Mark as completed (also decrements inflight_io)
@@ -1985,6 +2031,13 @@ fn statxToFileStat(statx: linux.Statx) fs.FileStatInfo {
 
 fn statxTimeToNanos(ts: linux.statx_timestamp) i64 {
     return @as(i64, ts.sec) * std.time.ns_per_s + ts.nsec;
+}
+
+/// A batch receive that filled every slot likely left more datagrams queued:
+/// the next one on the socket tries recvmmsg directly (`recv_hints`).
+fn updateRecvHint(self: *Self, data: *NetRecvMmsg) void {
+    const full = if (data.getResult()) |n| n == data.slots.len else |_| false;
+    if (full) self.recv_hints.insert(data.handle) else self.recv_hints.remove(data.handle);
 }
 
 fn storeRecvMmsgResult(c: *Completion, res: i32, _: u32) void {
