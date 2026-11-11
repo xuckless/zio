@@ -308,6 +308,96 @@ const splice_no_offset: u64 = std.math.maxInt(u64);
 const SPLICE_F_MOVE: u32 = 1;
 const SPLICE_F_MORE: u32 = 4;
 
+/// Listening sockets whose last accept on this loop reported more connections
+/// waiting (IORING_CQE_F_SOCK_NONEMPTY, Linux 6.10+). An accept on one of them
+/// first tries accept(2) directly, so it can finish inside `add`; on an idle
+/// listener it costs nothing. The listener must be nonblocking, as the epoll
+/// backend's accept already requires. An entry is only a hint: another loop
+/// may have taken the connections, or the fd been closed on another loop and
+/// reused, which a failed direct accept clears. Open addressing by fd, with
+/// backward-shift deletion; a full table, likely holding such stale entries,
+/// is cleared.
+const AcceptHints = struct {
+    const size = 32;
+    fds: [size]net.fd_t = @splat(-1),
+
+    fn home(fd: net.fd_t) usize {
+        return @as(usize, @intCast(fd)) % size;
+    }
+
+    fn find(self: *const AcceptHints, fd: net.fd_t) ?usize {
+        if (fd < 0) return null;
+        var i = home(fd);
+        for (0..size) |_| {
+            if (self.fds[i] == fd) return i;
+            if (self.fds[i] == -1) return null;
+            i = (i + 1) % size;
+        }
+        return null;
+    }
+
+    fn contains(self: *const AcceptHints, fd: net.fd_t) bool {
+        return self.find(fd) != null;
+    }
+
+    fn insert(self: *AcceptHints, fd: net.fd_t) void {
+        if (fd < 0) return;
+        for (0..2) |_| {
+            var i = home(fd);
+            for (0..size) |_| {
+                if (self.fds[i] == fd) return;
+                if (self.fds[i] == -1) {
+                    self.fds[i] = fd;
+                    return;
+                }
+                i = (i + 1) % size;
+            }
+            self.* = .{};
+        }
+    }
+
+    fn remove(self: *AcceptHints, fd: net.fd_t) void {
+        var hole = self.find(fd) orelse return;
+        var j = hole;
+        while (true) {
+            j = (j + 1) % size;
+            const f = self.fds[j];
+            if (f == -1) break;
+            // f can move into the hole unless its home lies cyclically in
+            // (hole, j], where the hole is not on its probe path.
+            const h = home(f);
+            const stays = if (hole <= j) (h > hole and h <= j) else (h > hole or h <= j);
+            if (!stays) {
+                self.fds[hole] = f;
+                hole = j;
+            }
+        }
+        self.fds[hole] = -1;
+    }
+};
+
+test "AcceptHints: insert, find and remove across collisions" {
+    var t: AcceptHints = .{};
+    // 3, 35 and 67 share a home slot; 4 sits where 35 probes to.
+    for ([_]net.fd_t{ 3, 35, 4, 67, 31, 63 }) |fd| t.insert(fd);
+    for ([_]net.fd_t{ 3, 35, 4, 67, 31, 63 }) |fd| try std.testing.expect(t.contains(fd));
+    t.remove(35);
+    try std.testing.expect(!t.contains(35));
+    for ([_]net.fd_t{ 3, 4, 67, 31, 63 }) |fd| try std.testing.expect(t.contains(fd));
+    t.remove(31);
+    try std.testing.expect(t.contains(63));
+    t.remove(3);
+    try std.testing.expect(t.contains(67));
+    try std.testing.expect(t.contains(4));
+    try std.testing.expect(!t.contains(-1));
+    t.insert(-1);
+    try std.testing.expect(!t.contains(-1));
+    // Filling the table clears it for the next entry.
+    for (0..AcceptHints.size + 1) |i| t.insert(@intCast(100 + i));
+    try std.testing.expect(!t.contains(4));
+    try std.testing.expect(t.contains(100 + AcceptHints.size));
+}
+
 const Self = @This();
 
 const log = @import("../../../common.zig").log;
@@ -340,6 +430,7 @@ shared_state: *SharedState,
 /// plain counter suffices. Read by hasInflight() to skip the enter syscall
 /// when nothing can arrive.
 inflight: usize = 0,
+accept_hints: AcceptHints = .{},
 
 pub fn init(self: *Self, allocator: std.mem.Allocator, queue_size: u16, shared_state: *SharedState) !void {
     var flags: u32 = 0;
@@ -554,6 +645,17 @@ fn submitInner(self: *Self, state: *LoopState, comptime op: Op, c: *Completion, 
         },
         .net_accept => {
             const data = c.cast(NetAccept);
+            if (self.accept_hints.contains(data.handle)) {
+                if (net.accept(data.handle, data.addr, data.addr_len, data.flags)) |handle| {
+                    c.setResult(.net_accept, handle);
+                    state.markCompletedFromBackend(c);
+                    return;
+                } else |_| {
+                    // Usually EAGAIN: another acceptor took the connection.
+                    // Any other error the ring reports again.
+                    self.accept_hints.remove(data.handle);
+                }
+            }
             const sqe = self.getSqeOrDefer(c) orelse return;
             var accept_flags: u32 = 0;
             if (data.flags.nonblocking) accept_flags |= linux.SOCK.NONBLOCK;
@@ -716,6 +818,7 @@ fn submitInner(self: *Self, state: *LoopState, comptime op: Op, c: *Completion, 
         },
         .net_close => {
             const data = c.cast(NetClose);
+            self.accept_hints.remove(data.handle);
             const sqe = self.getSqeOrDefer(c) orelse return;
             sqe.prep_close(data.handle);
             sqe.user_data = @intFromPtr(c);
@@ -740,6 +843,7 @@ fn submitInner(self: *Self, state: *LoopState, comptime op: Op, c: *Completion, 
                 .NOFOLLOW = !data.flags.follow_symlinks,
                 .NOCTTY = !data.flags.allow_ctty,
                 .PATH = data.flags.path_only,
+                .DIRECT = data.flags.direct,
             };
             const sqe = self.getSqeOrDefer(c) orelse return;
             if (data.flags.resolve_beneath) {
@@ -769,6 +873,7 @@ fn submitInner(self: *Self, state: *LoopState, comptime op: Op, c: *Completion, 
                 .CREAT = true,
                 .TRUNC = data.flags.truncate,
                 .EXCL = data.flags.exclusive,
+                .DIRECT = data.flags.direct,
             };
             const sqe = self.getSqeOrDefer(c) orelse return;
             if (data.flags.resolve_beneath) {
@@ -1107,6 +1212,14 @@ fn netSendFileIssue(self: *Self, c: *Completion) void {
 fn netSendFileAdvance(self: *Self, state: *LoopState, c: *Completion, res: i32) void {
     const data = c.cast(NetSendFile);
 
+    // Bytes a splice delivered to the socket count toward the result even
+    // when a cancel ends the chain right here.
+    if (res > 0 and !data.internal.polling and data.internal.stage == .to_socket) {
+        const n: usize = @intCast(res);
+        data.internal.in_pipe -= n;
+        data.internal.sent += n;
+    }
+
     // A cancel request can land between steps, and the kernel cancel only
     // catches the SQE that was in flight when it was submitted — checked
     // before issuing ANY further SQE (including the -EAGAIN poll bridge below:
@@ -1162,12 +1275,14 @@ fn netSendFileAdvance(self: *Self, state: *LoopState, c: *Completion, res: i32) 
                 // Cannot happen (the pipe holds in_pipe > 0 bytes); bail out
                 // rather than re-splice forever.
                 self.netSendFileCleanup(c);
-                c.setError(error.Unexpected);
+                if (data.internal.sent > 0) {
+                    c.setResult(.net_send_file, data.internal.sent);
+                } else {
+                    c.setError(error.Unexpected);
+                }
                 state.markCompletedFromBackend(c);
                 return;
             }
-            data.internal.in_pipe -= n;
-            data.internal.sent += n;
             if (data.internal.in_pipe > 0) {
                 self.netSendFileIssue(c);
             } else if (!data.internal.eof and data.internal.read_remaining > 0) {
@@ -1411,6 +1526,14 @@ pub fn poll(self: *Self, state: *LoopState, timeout: Duration) !bool {
             .net_recvmmsg => storeRecvMmsgResult(completion, cqe.res, cqe.flags),
             .net_sendmmsg => storeSendMmsgResult(completion, cqe.res),
             else => self.storeResult(completion, cqe.res),
+        }
+        if (completion.op == .net_accept) {
+            const handle = completion.cast(NetAccept).handle;
+            if (cqe.flags & linux.IORING_CQE_F_SOCK_NONEMPTY != 0) {
+                self.accept_hints.insert(handle);
+            } else {
+                self.accept_hints.remove(handle);
+            }
         }
 
         // Mark as completed (also decrements inflight_io)
@@ -1819,7 +1942,8 @@ noinline fn storeResultSlow(self: *Self, c: *Completion, res: i32) void {
             // netSendFileAdvance.
             const data = c.cast(NetSendFile);
             self.netSendFileCleanup(c);
-            if (res < 0) {
+            // An error only wins when nothing was sent (see NetSendFile).
+            if (res < 0 and data.internal.sent == 0) {
                 const errno: linux.E = @fromBackingInt(@intCast(-res));
                 c.setError(switch (data.internal.stage) {
                     .to_pipe => fs.errnoToFileReadError(errno),

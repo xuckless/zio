@@ -266,30 +266,6 @@ pub const FILE_BEGIN: DWORD = 0;
 pub const FILE_CURRENT: DWORD = 1;
 pub const FILE_END: DWORD = 2;
 
-pub extern "kernel32" fn CreateEventExW(
-    lpEventAttributes: ?*SECURITY_ATTRIBUTES,
-    lpName: ?LPCWSTR,
-    dwFlags: DWORD,
-    dwDesiredAccess: DWORD,
-) callconv(.winapi) ?HANDLE;
-
-pub const CREATE_EVENT_MANUAL_RESET: DWORD = 0x1;
-pub const EVENT_ALL_ACCESS: DWORD = 0x1F0003;
-
-/// FILE_MODE_INFORMATION.Mode bits: a handle opened without either is
-/// for overlapped I/O, with no file pointer kept by the system.
-pub const FILE_SYNCHRONOUS_IO_ALERT: ULONG = 0x10;
-pub const FILE_SYNCHRONOUS_IO_NONALERT: ULONG = 0x20;
-
-/// Whether `handle` was opened for overlapped I/O (FILE_FLAG_OVERLAPPED).
-pub fn isOverlapped(handle: HANDLE) bool {
-    var iosb: IO_STATUS_BLOCK = undefined;
-    var mode: ULONG = 0;
-    const status = NtQueryInformationFile(handle, &iosb, @ptrCast(&mode), @sizeOf(ULONG), .FileModeInformation);
-    if (status != .SUCCESS) return false;
-    return mode & (FILE_SYNCHRONOUS_IO_ALERT | FILE_SYNCHRONOUS_IO_NONALERT) == 0;
-}
-
 /// Returns true if `handle` is not seekable (pipe, socket, character device),
 /// in which case only streaming (positionless, zero-offset overlapped) I/O works
 /// and positional I/O is unavailable. Mirrors the POSIX lseek/ESPIPE probe: a
@@ -387,6 +363,10 @@ pub extern "kernel32" fn DuplicateHandle(
 // Thread/process functions
 pub extern "kernel32" fn GetCurrentThread() callconv(.winapi) HANDLE;
 pub extern "kernel32" fn GetCurrentProcess() callconv(.winapi) HANDLE;
+pub extern "kernel32" fn CancelSynchronousIo(hThread: HANDLE) callconv(.winapi) BOOL;
+
+/// Thread access right required by `CancelSynchronousIo`.
+pub const THREAD_TERMINATE: DWORD = 0x0001;
 
 // APC functions
 pub extern "kernel32" fn QueueUserAPC(

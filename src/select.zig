@@ -202,6 +202,10 @@ pub fn WaitResult(comptime T: type) type {
     };
 }
 
+/// Most futures one select can wait on. Bounds the signals a select can
+/// receive (see `drainRequeued` in `select`).
+const max_arms = 64;
+
 /// Behavior when a wait operation is canceled
 pub const CancelBehavior = enum {
     /// Propagate the cancellation error to the caller
@@ -277,6 +281,7 @@ pub fn select(futures: anytype) !SelectResult(@TypeOf(futures)) {
     const U = SelectResult(S);
     const field_names = compat.fieldNames(S);
     const field_types = compat.fieldTypes(S);
+    if (field_names.len > max_arms) @compileError("select supports at most 64 futures");
 
     // Self-wait detection: check all futures for self-wait
     const task = getCurrentTask();
@@ -297,7 +302,8 @@ pub fn select(futures: anytype) !SelectResult(@TypeOf(futures)) {
     var pending_winner: std.atomic.Value(usize) = .init(NO_WINNER);
 
     // Parent waiter that select waiters will signal when they win
-    var waiter = Waiter.init();
+    var waiter = Waiter.initSelectParent();
+    defer waiter.deinit();
 
     // Allocate WaitContext struct on stack for futures that need per-wait state
     const ContextsType = WaitContextsType(S);
@@ -321,6 +327,10 @@ pub fn select(futures: anytype) !SelectResult(@TypeOf(futures)) {
     // is left to its own source in the settle loop below, because a re-poll
     // may already have counted that signal via .requeued.
     var promoted = false;
+    // Arms a re-poll found popped (.requeued). The popped registration's
+    // signal may still be on its way, and it can win the select itself; then
+    // the claim and the counted signal are the same one.
+    var requeued: [field_names.len]bool = @splat(false);
     var decided = false;
 
     // Registration sweep. On a first call .requeued means .queued and
@@ -355,6 +365,7 @@ pub fn select(futures: anytype) !SelectResult(@TypeOf(futures)) {
             reg: *const [field_names.len]bool,
             prior: *u32,
             selfc: *bool,
+            requeued_arms: *[field_names.len]bool,
         ) bool {
             inline for (field_names, field_types, 0..) |name, FieldType, i| {
                 if (reg[i]) {
@@ -373,12 +384,32 @@ pub fn select(futures: anytype) !SelectResult(@TypeOf(futures)) {
                             return true;
                         },
                         .queued => {},
-                        .requeued => prior.* += 1,
+                        .requeued => {
+                            prior.* += 1;
+                            requeued_arms[i] = true;
+                        },
                         .decided => return true,
                     }
                 }
             }
             return false;
+        }
+
+        /// Wait for the signals a re-poll reported as .requeued: each comes
+        /// from a registration that was popped before the re-poll and is
+        /// still owed. Every such signal is a notification that tries to
+        /// claim this select, so once they have all landed the select either
+        /// has a winner or has a bounced arm to promote. That bounds the
+        /// signals one select can receive by its arm count: at most one
+        /// popped and one live registration per arm, plus the claim.
+        fn drainRequeued(
+            parent: *Waiter,
+            prior: u32,
+            win: *const std.atomic.Value(usize),
+            pend: *const std.atomic.Value(usize),
+        ) void {
+            parent.wait(prior, .no_cancel);
+            std.debug.assert(win.load(.acquire) != NO_WINNER or pend.load(.acquire) != NO_WINNER);
         }
     };
 
@@ -403,7 +434,9 @@ pub fn select(futures: anytype) !SelectResult(@TypeOf(futures)) {
                 // that skipped us may be parked by now; re-poll before we
                 // park, or both sides sleep through a valid pairing.
                 gen_seen = g;
-                if (Poll.repoll(&futures, &waiters, &contexts, &registered, &prior_signals, &self_claimed)) break :park;
+                const prior_before = prior_signals;
+                if (Poll.repoll(&futures, &waiters, &contexts, &registered, &prior_signals, &self_claimed, &requeued)) break :park;
+                if (prior_signals != prior_before) Poll.drainRequeued(&waiter, prior_signals, &winner, &pending_winner);
                 continue :park;
             }
             waiter.wait(consumed_wakes + 1, .allow_cancel) catch {
@@ -420,7 +453,9 @@ pub fn select(futures: anytype) !SelectResult(@TypeOf(futures)) {
             // A signal landed without a claim: the claimer saw our commit
             // fence. The readiness it reported is standing; re-poll finds it.
             consumed_wakes += 1;
-            if (Poll.repoll(&futures, &waiters, &contexts, &registered, &prior_signals, &self_claimed)) break :park;
+            const prior_before = prior_signals;
+            if (Poll.repoll(&futures, &waiters, &contexts, &registered, &prior_signals, &self_claimed, &requeued)) break :park;
+            if (prior_signals != prior_before) Poll.drainRequeued(&waiter, prior_signals, &winner, &pending_winner);
         }
     }
 
@@ -434,7 +469,14 @@ pub fn select(futures: anytype) !SelectResult(@TypeOf(futures)) {
     // re-poll may have already re-registered the arm and counted that signal
     // as .requeued, in which case asyncCancelWait removes the new
     // registration and reports nothing owed.
-    const settled = if (promoted) NO_WINNER else hint;
+    //
+    // So does an external winner on an arm a re-poll found popped: the claim
+    // came either from the popped registration's late signal, already
+    // counted, while the new registration is still queued (asyncCancelWait
+    // removes it and reports nothing owed), or from the new registration,
+    // whose signal asyncCancelWait then reports as owed.
+    const requeued_winner = hint != NO_WINNER and !self_claimed and !promoted and requeued[hint];
+    const settled = if (promoted or requeued_winner) NO_WINNER else hint;
     var expected: u32 = prior_signals;
     inline for (field_names, field_types, 0..) |name, FieldType, i| {
         if (registered[i] and i != settled) {
@@ -446,8 +488,8 @@ pub fn select(futures: anytype) !SelectResult(@TypeOf(futures)) {
         }
     }
     // An external winner's claim carries one signal; a self-claimed win sends
-    // none, and a promoted one was just accounted for above.
-    if (hint != NO_WINNER and !self_claimed and !promoted) expected += 1;
+    // none, and a promoted or requeued one was just accounted for above.
+    if (hint != NO_WINNER and !self_claimed and !promoted and !requeued_winner) expected += 1;
     waiter.wait(expected, .no_cancel);
 
     const winner_index = winner.load(.acquire);
@@ -461,7 +503,7 @@ pub fn select(futures: anytype) !SelectResult(@TypeOf(futures)) {
     // the request back for the next cancelable operation. A null task
     // binding means the wait blocked the thread and consumed nothing.
     if (canceled) {
-        if (waiter.mode.direct.task) |t| t.recancel();
+        if (waiter.directTask()) |t| t.recancel();
     }
 
     // Return result from winner.
@@ -483,7 +525,7 @@ pub fn select(futures: anytype) !SelectResult(@TypeOf(futures)) {
 /// Returns the index of the first awaitable to complete.
 /// Used by std.Io.selectImpl.
 pub fn selectAwaitables(awaitables: []const *Awaitable) Cancelable!usize {
-    const max_awaitables = 64;
+    const max_awaitables = max_arms;
     if (awaitables.len > max_awaitables) {
         @panic("selectAwaitables: too many awaitables (max 64)");
     }
@@ -493,7 +535,8 @@ pub fn selectAwaitables(awaitables: []const *Awaitable) Cancelable!usize {
     // Never written here: this select takes no commit fence (no channel
     // arms), so no notification can bounce. Present only to build the arms.
     var pending_winner: std.atomic.Value(usize) = .init(NO_WINNER);
-    var waiter = Waiter.init();
+    var waiter = Waiter.initSelectParent();
+    defer waiter.deinit();
     var waiters: [max_awaitables]Waiter = undefined;
 
     for (waiters[0..awaitables.len], 0..) |*w, i| {
@@ -552,7 +595,7 @@ pub fn selectAwaitables(awaitables: []const *Awaitable) Cancelable!usize {
     // operation. A null task binding means the wait blocked the thread and
     // consumed nothing.
     if (canceled) {
-        if (waiter.mode.direct.task) |t| t.recancel();
+        if (waiter.directTask()) |t| t.recancel();
     }
     return winner_index;
 }
@@ -565,6 +608,7 @@ fn waitInternal(future: anytype, comptime flags: WaitFlags) Cancelable!WaitResul
     }
 
     var waiter = Waiter.init();
+    defer waiter.deinit();
 
     // Allocate WaitContext if needed
     const WaitCtx = FutureWaitContext(@TypeOf(future));
@@ -645,21 +689,19 @@ pub fn wait(future: anytype) Cancelable!WaitResult(FutureResult(@TypeOf(future))
     return waitInternal(future, .{ .on_cancel = .propagate });
 }
 
-/// Wait for a single future to complete, never propagating cancellation.
-/// When canceled, cancels the child task and continues waiting until it completes.
-/// This ensures the function always returns a result and never returns error.Canceled;
-/// the cancellation is re-armed instead, so the caller's next cancellation point
-/// reports it, even if the child swallowed the one forwarded to it.
-/// `future` must be a pointer to a future type.
+/// Wait for a task to complete, never propagating cancellation.
+/// When canceled, cancels the task and continues waiting until it completes,
+/// so this never returns error.Canceled; the cancellation is re-armed instead,
+/// so the caller's next cancellation point reports it, even if the task
+/// swallowed the one forwarded to it.
 /// Works from both coroutines and threads.
 ///
-/// Example:
-/// ```
-/// const value = waitUntilComplete(&future); // never returns error.Canceled
-/// // value is directly FutureResult (e.g., error{Foo}!i32)
-/// ```
-pub fn waitUntilComplete(future: anytype) FutureResult(@TypeOf(future)) {
-    const result = waitInternal(future, .{ .on_cancel = .cancel_and_continue }) catch unreachable;
+/// Only a single task is accepted: canceling it only requests the cancel and
+/// never waits, so the cancel path opens no second wait while this one is
+/// still registered. Canceling a group or a join handle waits for the tasks
+/// to finish.
+pub fn waitUntilComplete(awaitable: *Awaitable) void {
+    const result = waitInternal(awaitable, .{ .on_cancel = .cancel_and_continue }) catch unreachable;
     return result.value;
 }
 
@@ -1205,28 +1247,141 @@ test "waitUntilComplete: re-arms the caller's cancellation in join" {
 }
 
 test "waitUntilComplete: re-arms the caller's cancellation in JoinHandle.cancel" {
+    const Event = @import("sync/Event.zig");
     const rt = try Runtime.init(std.testing.allocator, .{});
     defer rt.deinit();
 
+    const Ctx = struct {
+        // Set by the child once the parent's cancel reached it, so the
+        // parent is known to be waiting in `JoinHandle.cancel`.
+        parent_waiting: Event = .init,
+        // Set by the test once the parent's own cancel was requested; the
+        // child keeps the parent waiting until then.
+        go: Event = .init,
+    };
+
     const T = struct {
-        fn child() void {
-            // Swallows its cancellation, then keeps the parent waiting.
+        fn child(ctx: *Ctx) void {
+            // Swallows its cancellation.
             rt_mod.sleep(.fromSeconds(60)) catch {};
-            rt_mod.sleep(.fromMilliseconds(100)) catch {};
+            ctx.parent_waiting.set();
+            // The parent forwards its own cancel here, which may end this
+            // wait early; either way the parent saw its cancel first.
+            ctx.go.wait() catch {};
         }
 
-        fn parent(r: *Runtime) !void {
-            var handle = try r.spawn(child, .{});
-            rt_mod.sleep(.fromMilliseconds(1)) catch return error.TestUnexpectedResult;
+        fn parent(r: *Runtime, ctx: *Ctx) !void {
+            var handle = try r.spawn(child, .{ctx});
             handle.cancel();
             try std.testing.expectError(error.Canceled, rt_mod.checkCancel());
         }
     };
 
-    var handle = try rt.spawn(T.parent, .{rt});
+    var ctx: Ctx = .{};
+    var handle = try rt.spawn(T.parent, .{ rt, &ctx });
     defer handle.cancel();
 
-    try rt.sleep(.fromMilliseconds(20));
-    handle.cancel();
+    try ctx.parent_waiting.wait();
+    handle.requestCancel();
+    ctx.go.set();
     try handle.join();
+}
+/// A source popped the first registration of arm `late` and is about to
+/// signal it (its completer stalls between pop and signal); meanwhile the
+/// source's readiness lapsed, so the select's re-poll registers the arm again
+/// and gets .requeued. Then either the late signal wins the select itself, or
+/// the new registration is popped and wins and the late signal loses. Either
+/// way the select must outwait exactly the signals that exist.
+fn testRequeuedWinner(new_registration_wins: bool) !void {
+    const LateArm = struct {
+        stashed: ?*Waiter = null,
+        polls: u32 = 0,
+        new_wins: bool,
+        new_popped: bool = false,
+
+        pub const Result = void;
+
+        pub fn asyncWait(self: *@This(), waiter: *Waiter) common.AsyncWaitState {
+            self.polls += 1;
+            if (self.polls == 1) {
+                self.stashed = waiter;
+                return .queued;
+            }
+            return .requeued;
+        }
+
+        pub fn asyncCancelWait(self: *@This(), waiter: *Waiter) bool {
+            _ = waiter;
+            return !self.new_popped;
+        }
+
+        pub fn getResult(self: *@This()) void {
+            _ = self;
+        }
+
+        fn fire(self: *@This()) !void {
+            try rt_mod.sleep(.fromMilliseconds(20));
+            // Both registrations use the same waiter, so popping the new one
+            // and signaling it is the same call as the late signal.
+            if (self.new_wins) {
+                self.new_popped = true;
+                self.stashed.?.signal();
+            }
+            self.stashed.?.signal();
+        }
+    };
+
+    const FenceArm = struct {
+        late: *LateArm,
+        polls: u32 = 0,
+
+        pub const Result = void;
+
+        pub fn asyncWait(self: *@This(), waiter: *Waiter) common.AsyncWaitState {
+            self.polls += 1;
+            if (self.polls == 1) {
+                // A claim attempt on the late arm while our fence is up bumps
+                // the select's generation, which forces the re-poll.
+                if (!waiter.beginCommit()) return .decided;
+                std.debug.assert(self.late.stashed.?.tryClaim() == .busy);
+                waiter.abortCommit();
+            }
+            return .queued;
+        }
+
+        pub fn asyncCancelWait(self: *@This(), waiter: *Waiter) bool {
+            _ = self;
+            _ = waiter;
+            return true;
+        }
+
+        pub fn getResult(self: *@This()) void {
+            _ = self;
+        }
+    };
+
+    const Body = struct {
+        fn run(new_wins: bool) !void {
+            var late: LateArm = .{ .new_wins = new_wins };
+            var fence: FenceArm = .{ .late = &late };
+            var group: @import("group.zig").Group = .init;
+            defer group.cancel();
+            try group.spawn(LateArm.fire, .{&late});
+            const result = try select(.{ .late = &late, .fence = &fence });
+            try std.testing.expectEqual(std.meta.Tag(@TypeOf(result)).late, std.meta.activeTag(result));
+        }
+    };
+
+    const runtime = try Runtime.init(std.testing.allocator, .{ .executors = .exact(1) });
+    defer runtime.deinit();
+    var handle = try runtime.spawn(Body.run, .{new_registration_wins});
+    try handle.join();
+}
+
+test "select: the late signal of a popped registration wins the select" {
+    try testRequeuedWinner(false);
+}
+
+test "select: the new registration of a popped arm wins, its late signal loses" {
+    try testRequeuedWinner(true);
 }

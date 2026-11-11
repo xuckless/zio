@@ -191,7 +191,7 @@ fn signalHandlerUnix(sig: posix.SIG) callconv(.c) void {
 
             // Wake all waiting tasks
             while (entry.waiters.pop()) |wait_node| {
-                Waiter.fromNode(wait_node).signal();
+                Waiter.fromNode(wait_node).signalExternal();
             }
         }
     }
@@ -214,7 +214,7 @@ fn consoleCtrlHandlerWindows(ctrl_type: w.DWORD) callconv(.winapi) w.BOOL {
 
             // Wake all waiting tasks
             while (entry.waiters.pop()) |wait_node| {
-                Waiter.fromNode(wait_node).signal();
+                Waiter.fromNode(wait_node).signalExternal();
             }
 
             found_handler = true;
@@ -285,6 +285,7 @@ pub const Signal = struct {
 
         // Stack-allocated waiter - separates operation wait node from task wait node
         var waiter: Waiter = .init();
+        defer waiter.deinit();
 
         // Add to wait queue
         self.entry.waiters.push(&waiter.node);
@@ -324,6 +325,7 @@ pub const Signal = struct {
 
         // Stack-allocated waiter - separates operation wait node from task wait node
         var waiter: Waiter = .init();
+        defer waiter.deinit();
 
         // Add to wait queue
         self.entry.waiters.push(&waiter.node);
@@ -652,7 +654,8 @@ test "Signal: a delivery that races the commit fence is not lost" {
     var sig = try Signal.init(.interrupt);
     defer sig.deinit();
 
-    var parent = Waiter.init();
+    var parent = Waiter.initSelectParent();
+    defer parent.deinit();
     var winner: std.atomic.Value(usize) = .init(NO_WINNER);
     var gen: std.atomic.Value(u32) = .init(0);
     var pending: std.atomic.Value(usize) = .init(NO_WINNER);

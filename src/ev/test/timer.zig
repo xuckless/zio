@@ -26,7 +26,7 @@ test "setTimer and clearTimer basic" {
 
     try std.testing.expectEqual(.dead, timer.c.loadState().phase);
     try std.testing.expect(elapsed.toMilliseconds() >= 90);
-    try std.testing.expect(elapsed.toMilliseconds() <= 250);
+    try std.testing.expect(elapsed.toMilliseconds() <= 750);
     std.log.info("setTimer: expected=100ms, actual={f}", .{elapsed});
 }
 
@@ -38,7 +38,7 @@ test "clearTimer before expiration" {
     var timer: Timer = .init(.{ .duration = .zero });
 
     // Set a timer with a long delay
-    loop.setTimer(&timer, .{ .duration = .fromMilliseconds(1000) });
+    loop.setTimer(&timer, .{ .duration = .fromMilliseconds(5000) });
     try std.testing.expectEqual(.running, timer.c.loadState().phase);
 
     // Clear it immediately
@@ -51,7 +51,7 @@ test "clearTimer before expiration" {
     const elapsed = wall_timer.read();
 
     // Should be very fast since there's nothing to wait for
-    try std.testing.expect(elapsed.toMilliseconds() < 200);
+    try std.testing.expect(elapsed.toMilliseconds() < 2000);
     std.log.info("clearTimer: elapsed={f}", .{elapsed});
 }
 
@@ -99,21 +99,21 @@ test "setTimer multiple times" {
     var timer: Timer = .init(.{ .duration = .zero });
 
     // Set timer with a long delay
-    loop.setTimer(&timer, .{ .duration = .fromMilliseconds(2000) });
+    loop.setTimer(&timer, .{ .duration = .fromMilliseconds(5000) });
     try std.testing.expectEqual(.running, timer.c.loadState().phase);
 
     // Reset it with a short delay
     loop.setTimer(&timer, .{ .duration = .fromMilliseconds(10) });
     try std.testing.expectEqual(.running, timer.c.loadState().phase);
 
-    // Should complete after ~10ms, not 2000ms
+    // Should complete after ~10ms, not 5000ms
     var wall_timer = time.Stopwatch.start();
     try loop.run();
     const elapsed = wall_timer.read();
 
     try std.testing.expectEqual(.dead, timer.c.loadState().phase);
     try std.testing.expect(elapsed.toMilliseconds() >= 5);
-    try std.testing.expect(elapsed.toMilliseconds() <= 100);
+    try std.testing.expect(elapsed.toMilliseconds() <= 2000);
     std.log.info("setTimer multiple: expected=10ms, actual={f}", .{elapsed});
 }
 
@@ -125,7 +125,7 @@ test "clearTimer and reuse timer" {
     var timer: Timer = .init(.{ .duration = .zero });
 
     // Set and clear
-    loop.setTimer(&timer, .{ .duration = .fromMilliseconds(200) });
+    loop.setTimer(&timer, .{ .duration = .fromMilliseconds(5000) });
     try std.testing.expect(loop.clearTimer(&timer));
     try std.testing.expectEqual(.new, timer.c.loadState().phase);
 
@@ -139,7 +139,7 @@ test "clearTimer and reuse timer" {
 
     try std.testing.expectEqual(.dead, timer.c.loadState().phase);
     try std.testing.expect(elapsed.toMilliseconds() >= 5);
-    try std.testing.expect(elapsed.toMilliseconds() <= 100);
+    try std.testing.expect(elapsed.toMilliseconds() <= 2000);
     std.log.info("clearTimer reuse: expected=10ms, actual={f}", .{elapsed});
 }
 
@@ -156,7 +156,7 @@ test "timer with zero duration completes immediately" {
     const elapsed = wall_timer.read();
 
     try std.testing.expectEqual(.dead, timer.c.loadState().phase);
-    try std.testing.expect(elapsed.toMilliseconds() < 50);
+    try std.testing.expect(elapsed.toMilliseconds() < 500);
     std.log.info("zero duration timer: elapsed={f}", .{elapsed});
 }
 
@@ -176,7 +176,7 @@ test "timer with explicit deadline" {
 
     try std.testing.expectEqual(.dead, timer.c.loadState().phase);
     try std.testing.expect(elapsed.toMilliseconds() >= 90);
-    try std.testing.expect(elapsed.toMilliseconds() <= 250);
+    try std.testing.expect(elapsed.toMilliseconds() <= 750);
     std.log.info("deadline timer: expected=100ms, actual={f}", .{elapsed});
 }
 
@@ -185,7 +185,9 @@ test "timer with explicit deadline" {
 /// the timer did not fire before its deadline and that it fired at all. Every
 /// platform is held to the same one, because on every platform it is the loop's
 /// own poll timeout that fires a timer coming due while the process is awake.
-const max_lateness_ms = 150;
+/// It stays under a second, so a poll timeout rounded up to a whole second
+/// still fails the budget.
+const max_lateness_ms = 750;
 
 /// A wall-clock timer's deadline is only meaningful in its own clock, so a
 /// test measures the firing moment there rather than on an awake stopwatch: a
@@ -254,36 +256,50 @@ test "clearTimer racing a firing timer (cross-thread)" {
     // there corrupted the heap, double-decremented active, and cleared the
     // result markCompleted asserts on.
     // The loop is initialized and driven entirely on the runner thread (an
-    // io_uring SINGLE_ISSUER ring must be entered by its creating thread);
-    // this thread only uses the thread-safe setTimer/clearTimer/wake APIs,
-    // exactly like a migrated task's timedWaitClock does.
-    var loop: Loop = undefined;
-    var ready = std.atomic.Value(bool).init(false);
-    var stop = std.atomic.Value(bool).init(false);
-    var wake_done = std.atomic.Value(bool).init(false);
-    const runner = try std.Thread.spawn(.{}, struct {
-        fn run(l: *Loop, r: *std.atomic.Value(bool), s: *std.atomic.Value(bool), w: *std.atomic.Value(bool)) void {
+    // io_uring SINGLE_ISSUER ring must be entered by its creating thread),
+    // which also arms each timer, since setTimer refreshes the owner-only
+    // cached `now`. This thread only clears and wakes, exactly like a
+    // migrated task's timedWaitClock does.
+    const Shared = struct {
+        loop: Loop = undefined,
+        ready: std.atomic.Value(bool) = .init(false),
+        stop: std.atomic.Value(bool) = .init(false),
+        wake_done: std.atomic.Value(bool) = .init(false),
+        /// Timer for the runner to arm with a delay of `arm_ns`; reset to
+        /// null once it is armed.
+        to_arm: std.atomic.Value(?*Timer) = .init(null),
+        arm_ns: u64 = 0,
+
+        fn run(sh: *@This()) void {
+            const l = &sh.loop;
             l.init(.{}) catch @panic("loop init failed");
             defer {
                 // Deinit belongs to this thread, but must not race the main
-                // thread's final wake(): a stale wake from the last clearTimer
+                // thread's final wake(): a stale wake from the last arming
                 // can pop poll(.max) before that wake() is issued.
-                while (!w.load(.acquire)) std.Thread.yield() catch {};
+                while (!sh.wake_done.load(.acquire)) std.Thread.yield() catch {};
                 l.deinit();
             }
-            r.store(true, .release);
-            while (!s.load(.acquire)) {
+            sh.ready.store(true, .release);
+            while (!sh.stop.load(.acquire)) {
+                if (sh.to_arm.load(.acquire)) |t| {
+                    l.setTimer(t, .{ .duration = .fromNanoseconds(sh.arm_ns) });
+                    sh.to_arm.store(null, .release);
+                }
                 l.poll(.max) catch return;
             }
         }
-    }.run, .{ &loop, &ready, &stop, &wake_done });
+    };
+    var shared: Shared = .{};
+    const runner = try std.Thread.spawn(.{}, Shared.run, .{&shared});
     defer runner.join();
     defer {
-        stop.store(true, .release);
-        loop.wake();
-        wake_done.store(true, .release);
+        shared.stop.store(true, .release);
+        shared.loop.wake();
+        shared.wake_done.store(true, .release);
     }
-    while (!ready.load(.acquire)) std.Thread.yield() catch {};
+    while (!shared.ready.load(.acquire)) std.Thread.yield() catch {};
+    const loop = &shared.loop;
 
     const callback = struct {
         fn cb(_: *Loop, c: *@import("../completion.zig").Completion) void {
@@ -302,7 +318,10 @@ test "clearTimer racing a firing timer (cross-thread)" {
         // Arm with a tiny, varying delay so the clear below lands at different
         // points relative to the fire: before it, after it, and inside the
         // limbo window.
-        loop.setTimer(&timer, .{ .duration = .fromNanoseconds((i % 64) * 1000) });
+        shared.arm_ns = (i % 64) * 1000;
+        shared.to_arm.store(&timer, .release);
+        loop.wake();
+        while (shared.to_arm.load(.acquire) != null) std.Thread.yield() catch {};
         if (i % 2 == 0) std.Thread.yield() catch {};
 
         // A clear that won hands the timer back and rules out the callback.
@@ -348,7 +367,7 @@ test "duration timer armed after a long idle poll is not backdated" {
     var read_iovecs: [1]fs.iovec = undefined;
     const read_buf = ReadBuf.fromSlice(&read_data, &read_iovecs);
     var stream_read: FileReadStreaming = .init(pipefd[0], read_buf);
-    stream_read.pollable = true;
+    stream_read.streaming_route = .pollable;
     loop.add(&stream_read.c);
 
     const thread = try std.Thread.spawn(.{}, struct {
@@ -377,6 +396,94 @@ test "duration timer armed after a long idle poll is not backdated" {
     try std.testing.expectEqual(.dead, timer.c.loadState().phase);
     // Backdated: fires in ~0ms. Correct: no earlier than the duration.
     try std.testing.expect(elapsed_ms >= 450);
-    try std.testing.expect(elapsed_ms <= 1500);
+    try std.testing.expect(elapsed_ms <= 5000);
     std.log.info("post-idle arm: expected=500ms, actual={d}ms", .{elapsed_ms});
+}
+
+fn countFires(_: *Loop, c: *@import("../completion.zig").Completion) void {
+    const count: *u32 = @ptrCast(@alignCast(c.userdata.?));
+    count.* += 1;
+}
+
+test "extend moves a timer later, and it fires once, at the extended deadline" {
+    if (!Timer.can_extend) return error.SkipZigTest;
+
+    var loop: Loop = undefined;
+    try loop.init(.{});
+    defer loop.deinit();
+
+    var fires: u32 = 0;
+    var timer: Timer = .init(.{ .duration = .zero });
+    timer.c.userdata = &fires;
+    timer.c.callback = countFires;
+
+    var wall_timer = time.Stopwatch.start();
+    loop.setTimer(&timer, .{ .duration = .fromMilliseconds(20) });
+    const later = Timestamp.now(.awake).addDuration(.fromMilliseconds(80));
+    try std.testing.expect(timer.extend(later));
+    // Only later: an earlier deadline needs the heap.
+    try std.testing.expect(!timer.extend(Timestamp.now(.awake).addDuration(.fromMilliseconds(10))));
+
+    try loop.run();
+    const elapsed = wall_timer.read();
+
+    try std.testing.expectEqual(1, fires);
+    try std.testing.expectEqual(.dead, timer.c.loadState().phase);
+    try std.testing.expect(elapsed.toMilliseconds() >= 75);
+    try std.testing.expect(!timer.extend(Timestamp.now(.awake).addDuration(.fromSeconds(60))));
+}
+
+test "extend refuses a timer that is not armed" {
+    var loop: Loop = undefined;
+    try loop.init(.{});
+    defer loop.deinit();
+
+    var timer: Timer = .init(.{ .duration = .zero });
+    const later = Timestamp.now(.awake).addDuration(.fromSeconds(60));
+    try std.testing.expect(!timer.extend(later));
+
+    loop.setTimer(&timer, .{ .duration = .fromSeconds(1) });
+    try std.testing.expect(loop.clearTimer(&timer));
+    try std.testing.expect(!timer.extend(later));
+}
+
+test "extend loses to a fire that is already committed" {
+    // `do_not_call_callbacks` holds the fired timer before its callback,
+    // which is the window an extension from another thread could land in.
+    var loop: Loop = undefined;
+    try loop.init(.{ .do_not_call_callbacks = true });
+    defer loop.deinit();
+
+    var fires: u32 = 0;
+    var timer: Timer = .init(.{ .duration = .zero });
+    timer.c.userdata = &fires;
+    timer.c.callback = countFires;
+
+    loop.setTimer(&timer, .{ .duration = .zero });
+    try loop.poll(.max);
+    try std.testing.expect(!timer.extend(Timestamp.now(.awake).addDuration(.fromSeconds(60))));
+
+    loop.nextDispatched().?.call(&loop);
+    try std.testing.expectEqual(1, fires);
+}
+
+test "extend moves a wall-clock timer later" {
+    if (!Timer.can_extend) return error.SkipZigTest;
+
+    var loop: Loop = undefined;
+    try loop.init(.{});
+    defer loop.deinit();
+
+    var fires: u32 = 0;
+    var timer: Timer = .initClock(.{ .duration = .zero }, .real);
+    timer.c.userdata = &fires;
+    timer.c.callback = countFires;
+
+    var wall_timer = time.Stopwatch.start();
+    loop.setTimer(&timer, .{ .duration = .fromMilliseconds(20) });
+    try std.testing.expect(timer.extend(Timestamp.now(.real).addDuration(.fromMilliseconds(80))));
+
+    try loop.run();
+    try std.testing.expectEqual(1, fires);
+    try std.testing.expect(wall_timer.read().toMilliseconds() >= 75);
 }

@@ -1292,22 +1292,30 @@ pub fn pwritev(fd: fd_t, buffers: []const iovec_const, offset: u64) FileWriteErr
 /// Read from file descriptor - for pipes and stream-like fds
 pub fn read(fd: fd_t, buffer: []u8) FileReadError!usize {
     if (builtin.os.tag == .windows) {
-        var bytes_read: w.DWORD = undefined;
-        const success = w.ReadFile(
-            fd,
-            buffer.ptr,
-            @intCast(buffer.len),
-            &bytes_read,
-            null,
-        );
-        if (success == w.FALSE) {
-            const err = w.GetLastError();
-            switch (err) {
-                .HANDLE_EOF => return 0,
-                else => return errnoToFileReadError(err),
+        const sc = try syscall_cancel.Syscall.begin();
+        defer sc.finish();
+        while (true) {
+            var bytes_read: w.DWORD = undefined;
+            const success = w.ReadFile(
+                fd,
+                buffer.ptr,
+                @intCast(buffer.len),
+                &bytes_read,
+                null,
+            );
+            if (success == w.FALSE) {
+                const err = w.GetLastError();
+                switch (err) {
+                    .HANDLE_EOF => return 0,
+                    .OPERATION_ABORTED => {
+                        try sc.checkCancel();
+                        continue;
+                    },
+                    else => return errnoToFileReadError(err),
+                }
             }
+            return bytes_read;
         }
-        return bytes_read;
     }
 
     const sc = try syscall_cancel.Syscall.begin();
@@ -1325,61 +1333,37 @@ pub fn read(fd: fd_t, buffer: []u8) FileReadError!usize {
     }
 }
 
-/// One ReadFile or WriteFile at the handle's current position, for `readv`
-/// and `writev` on Windows. Without an OVERLAPPED, unless the handle was
-/// opened for overlapped I/O, as files are when the backend completes file
-/// I/O itself (IOCP, see `fileOpenWork`): Windows keeps no file pointer for
-/// such a handle and refuses a call without an OVERLAPPED with
-/// ERROR_INVALID_PARAMETER. There the position is the one the file object
-/// holds (SetFilePointerEx reads and sets it), given in an OVERLAPPED and
-/// moved past what was transferred; the call is waited for here, and the
-/// event's low bit keeps its completion off the port the handle is
-/// associated with. A handle without a position (a pipe) gets offset 0,
-/// which it ignores.
-fn windowsStreamingTransfer(
-    comptime direction: enum { read, write },
-    fd: fd_t,
-    ptr: if (direction == .write) [*]const u8 else [*]u8,
-    len: w.DWORD,
-) union(enum) { bytes: w.DWORD, failed: w.Win32Error } {
-    const call = if (direction == .write) w.WriteFile else w.ReadFile;
-    if (!w.isOverlapped(fd)) {
-        var n: w.DWORD = 0;
-        if (call(fd, ptr, len, &n, null) == w.FALSE) return .{ .failed = w.GetLastError() };
-        return .{ .bytes = n };
-    }
-    var position: w.LARGE_INTEGER = 0;
-    const seekable = w.SetFilePointerEx(fd, 0, &position, w.FILE_CURRENT) != w.FALSE;
-    const event = w.CreateEventExW(null, null, w.CREATE_EVENT_MANUAL_RESET, w.EVENT_ALL_ACCESS) orelse
-        return .{ .failed = w.GetLastError() };
-    defer _ = w.CloseHandle(event);
-    var overlapped = std.mem.zeroes(w.OVERLAPPED);
-    const offset: u64 = if (seekable) @intCast(position) else 0;
-    overlapped.DUMMYUNIONNAME.DUMMYSTRUCTNAME.Offset = @truncate(offset);
-    overlapped.DUMMYUNIONNAME.DUMMYSTRUCTNAME.OffsetHigh = @truncate(offset >> 32);
-    overlapped.hEvent = @ptrFromInt(@intFromPtr(event) | 1);
-    if (call(fd, ptr, len, null, &overlapped) == w.FALSE) {
-        const err = w.GetLastError();
-        if (err != .IO_PENDING) return .{ .failed = err };
-    }
-    var n: w.DWORD = 0;
-    if (w.GetOverlappedResult(fd, &overlapped, &n, w.TRUE) == w.FALSE) return .{ .failed = w.GetLastError() };
-    if (seekable) _ = w.SetFilePointerEx(fd, position + n, null, w.FILE_BEGIN);
-    return .{ .bytes = n };
-}
-
 /// Read from file descriptor using readv() - for pipes and stream-like fds
 pub fn readv(fd: fd_t, buffers: []iovec) FileReadError!usize {
     if (builtin.os.tag == .windows) {
+        const sc = try syscall_cancel.Syscall.begin();
+        defer sc.finish();
         var total_read: usize = 0;
         for (buffers) |buffer| {
-            const bytes_read = switch (windowsStreamingTransfer(.read, fd, buffer.buf, @intCast(buffer.len))) {
-                .bytes => |n| n,
-                .failed => |err| switch (err) {
-                    .HANDLE_EOF => return if (total_read == 0) 0 else total_read,
+            var bytes_read: w.DWORD = undefined;
+
+            while (true) {
+                const success = w.ReadFile(
+                    fd,
+                    buffer.buf,
+                    @intCast(buffer.len),
+                    &bytes_read,
+                    null,
+                );
+                if (success != w.FALSE) break;
+
+                const err = w.GetLastError();
+                switch (err) {
+                    .HANDLE_EOF => return total_read,
+                    .OPERATION_ABORTED => {
+                        // Bytes already read are consumed input: return them;
+                        // the cancel surfaces at the next cancellation point.
+                        sc.checkCancel() catch |e| return if (total_read == 0) e else total_read;
+                        continue;
+                    },
                     else => return errnoToFileReadError(err),
-                },
-            };
+                }
+            }
 
             total_read += bytes_read;
             if (bytes_read < buffer.len) break;
@@ -1406,18 +1390,29 @@ pub fn readv(fd: fd_t, buffers: []iovec) FileReadError!usize {
 /// Write to file descriptor - for pipes and stream-like fds
 pub fn write(fd: fd_t, buffer: []const u8) FileWriteError!usize {
     if (builtin.os.tag == .windows) {
-        var bytes_written: w.DWORD = undefined;
-        const success = w.WriteFile(
-            fd,
-            buffer.ptr,
-            @intCast(buffer.len),
-            &bytes_written,
-            null,
-        );
-        if (success == w.FALSE) {
-            return errnoToFileWriteError(w.GetLastError());
+        const sc = try syscall_cancel.Syscall.begin();
+        defer sc.finish();
+        while (true) {
+            var bytes_written: w.DWORD = undefined;
+            const success = w.WriteFile(
+                fd,
+                buffer.ptr,
+                @intCast(buffer.len),
+                &bytes_written,
+                null,
+            );
+            if (success == w.FALSE) {
+                const err = w.GetLastError();
+                switch (err) {
+                    .OPERATION_ABORTED => {
+                        try sc.checkCancel();
+                        continue;
+                    },
+                    else => return errnoToFileWriteError(err),
+                }
+            }
+            return bytes_written;
         }
-        return bytes_written;
     }
 
     const sc = try syscall_cancel.Syscall.begin();
@@ -1438,12 +1433,33 @@ pub fn write(fd: fd_t, buffer: []const u8) FileWriteError!usize {
 /// Write to file descriptor using writev() - for pipes and stream-like fds
 pub fn writev(fd: fd_t, buffers: []const iovec_const) FileWriteError!usize {
     if (builtin.os.tag == .windows) {
+        const sc = try syscall_cancel.Syscall.begin();
+        defer sc.finish();
         var total_written: usize = 0;
         for (buffers) |buffer| {
-            const bytes_written = switch (windowsStreamingTransfer(.write, fd, buffer.buf, @intCast(buffer.len))) {
-                .bytes => |n| n,
-                .failed => |err| return errnoToFileWriteError(err),
-            };
+            var bytes_written: w.DWORD = undefined;
+
+            while (true) {
+                const success = w.WriteFile(
+                    fd,
+                    buffer.buf,
+                    @intCast(buffer.len),
+                    &bytes_written,
+                    null,
+                );
+                if (success != w.FALSE) break;
+
+                const err = w.GetLastError();
+                switch (err) {
+                    .OPERATION_ABORTED => {
+                        // Bytes already written can't be taken back: report
+                        // them; the cancel surfaces at the next cancellation point.
+                        sc.checkCancel() catch |e| return if (total_written == 0) e else total_written;
+                        continue;
+                    },
+                    else => return errnoToFileWriteError(err),
+                }
+            }
 
             total_written += bytes_written;
             if (bytes_written < buffer.len) break;
@@ -3421,12 +3437,17 @@ pub fn dirRealPathFileZ(dir: fd_t, path: [*:0]const u8, buffer: []u8) DirRealPat
     // On non-Linux with libc, we can use realpath() directly for AT_FDCWD
     if (builtin.os.tag != .linux and builtin.link_libc and dir == posix.AT.FDCWD) {
         if (buffer.len < posix.PATH_MAX) return error.NameTooLong;
+        const sc = try syscall_cancel.Syscall.begin();
+        defer sc.finish();
         while (true) {
             if (std.c.realpath(path, buffer.ptr)) |_| {
                 return std.mem.indexOfScalar(u8, buffer, 0) orelse buffer.len;
             }
             const err: posix.system.E = @fromBackingInt(@intCast(std.c._errno().*));
-            if (err == .INTR) continue;
+            if (err == .INTR) {
+                try sc.checkCancel();
+                continue;
+            }
             return errnoToDirRealPathFileError(err);
         }
     }
@@ -3447,6 +3468,24 @@ pub fn dirRealPathFileZ(dir: fd_t, path: [*:0]const u8, buffer: []u8) DirRealPat
 
     // Now get the real path of the opened fd
     return dirRealPath(file_fd, buffer);
+}
+
+test "dirRealPathFileZ returns Canceled when the bound token is canceled" {
+    // The realpath() branch only runs on non-Linux with libc.
+    if (builtin.os.tag == .linux or builtin.os.tag == .windows) return error.SkipZigTest;
+    if (!builtin.link_libc) return error.SkipZigTest;
+    if (!syscall_cancel.enabled) return error.SkipZigTest;
+
+    // Bind a token to this thread the way a pool worker binds the token of the
+    // task it runs, then cancel it while it is idle: nothing is in flight, so
+    // no signal is sent and the cancel has to surface at the next syscall.
+    var token: syscall_cancel.Token = .{};
+    token.enter();
+    defer token.exit();
+    _ = token.cancel();
+
+    var buf: [posix.PATH_MAX]u8 = undefined;
+    try std.testing.expectError(error.Canceled, dirRealPathFileZ(cwd(), "/tmp", &buf));
 }
 
 fn errnoToDirRealPathFileError(errno: posix.system.E) DirRealPathFileError {

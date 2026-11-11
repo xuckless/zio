@@ -18,8 +18,23 @@ All notable changes to this project will be documented in this file.
 - `Socket.sendMany` now sends datagrams in batches with `sendmmsg` on Linux, FreeBSD
   and NetBSD, instead of one `sendmsg` and event loop round trip per datagram.
 
+- `ev.ThreadPool.init` no longer takes an allocator.
+
+- In safe builds, `Runtime.deinit` panics if a thread outside the runtime is still waking
+  one of its tasks, which means that thread was not stopped before shutdown (#905).
+
+- `select` accepts at most 64 futures, checked at compile time, matching `std.Io`'s select.
+
 - Spawning and finishing a task no longer updates a counter shared by all executors,
   which slowed down spawn-heavy programs on many cores.
+
+- Each executor now keeps a small cache of free coroutine stacks and exchanges them with
+  the shared pool in batches, so spawn-heavy programs on many cores spend less time on
+  the pool's lock.
+
+- The blocking thread pool now starts a new thread whenever no idle one can take a job,
+  up to a default `max_threads` of 512 (was twice the CPU count). The `scale_threshold`
+  option is removed.
 
 ### Added
 
@@ -27,6 +42,8 @@ All notable changes to this project will be documented in this file.
   address.
 
 - Added `Dir.sync`, to make files created, renamed or deleted in a directory durable.
+
+- Wine is now a supported platform, tested in CI alongside native Windows.
 
 - Added `CompletionQueue.submitAndWait`, to run a single event loop operation from a task
   without setting up a queue.
@@ -42,11 +59,46 @@ All notable changes to this project will be documented in this file.
 - An `AutoCancel` or `withTimeout` deadline that passed just after the operation finished
   no longer fails the task's next operation with `error.Canceled`.
 
+- On Windows, canceling a read or write of stdin, stdout or another synchronous pipe
+  waited until it finished, such as a stdin read until the user pressed Enter.
+
+- A cancel was lost when `std.Io.Group.async` could not spawn its task and ran it on the
+  caller instead.
+
+- A canceled `sendFile` reported `error.Canceled` even when part of the file had already
+  been sent, so the caller lost track of how much went out (#885).
+
+- Canceling a blocking call on a thread-pool worker could interrupt a worker thread that had
+  already exited.
+
+- `std.Io` `Batch.awaitConcurrent` returned `error.Canceled` even when some operations had
+  already completed, so a caller using `try` dropped their results (#886).
+
+- On Windows, a streaming read or write of a file opened with the IOCP backend, as
+  `Dir.writeFile` and `File.readStreaming` do, failed with `error.Unexpected` (#738).
+
 - Sockets accepted with the io_uring backend were blocking and leaked into child processes,
   and on Windows a socket bound before `connect` failed to connect.
 
+- With the epoll and kqueue backends, a timeout or cancel of one of several tasks receiving
+  or accepting on the same socket could crash or hang the program (#880).
+
+- Waking a task that waited on a mutex, channel, timeout or I/O could touch the task after
+  it had already finished and been freed, when the wake raced a cancellation or timeout.
+
 - Under sustained load, tasks that overflowed an executor's run queue could wait until the
   load dropped, stalling some connections for seconds.
+
+- Each thread-pool worker that retired after its idle timeout leaked its thread stack (#879).
+
+- Spawning a task into a group while another executor canceled the group could touch the
+  task after it had finished and been freed (#904).
+
+- `Runtime.deinit` could free an executor while a Windows DNS lookup or console control
+  callback, or a Unix signal handler, was still waking one of its tasks (#905).
+
+- A `select` could hang, and leave a registration behind on its source, when an event fired
+  and was reset while the select was re-checking its futures.
 
 - The io_uring backend ignored every send flag except `no_signal`, so a flag such as `oob`
   or `eor` had no effect.
@@ -60,6 +112,9 @@ All notable changes to this project will be documented in this file.
 
 - Fixed a panic in `Runtime.init` with more than one executor when logging through
   `zio.debug_io` (#804).
+
+- On Windows, writes to stdout or stderr could wait until a pending stdin read finished,
+  because the thread pool queued them behind it (#839).
 
 ## [0.19.0] - 2026-10-05
 
@@ -757,7 +812,6 @@ fixes continue on the `zig-0.16` branch.
 ### Fixed
 
 - Internal refactoring to handle data races on weakly ordered architectures in some cases.
-
 
 ## [0.9.0] - 2026-03-02
 

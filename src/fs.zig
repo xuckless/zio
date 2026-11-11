@@ -19,7 +19,7 @@ const waitForIoUncancelable = @import("common.zig").waitForIoUncancelable;
 const timedWaitForIo = @import("common.zig").timedWaitForIo;
 const fillBuf = @import("utils/writer.zig").fillBuf;
 const random = @import("random.zig").random;
-const probePollable = @import("ev/backends/common.zig").probePollable;
+const probeStreamingRoute = @import("ev/backends/common.zig").probeStreamingRoute;
 const Timeout = @import("time.zig").Timeout;
 
 pub const Handle = os.fs.fd_t;
@@ -128,8 +128,8 @@ pub fn createPipe() (os.fs.PipeError || Cancelable)!PipePair {
     try waitForIo(&op.c);
     const fds = try op.getResult();
     return .{
-        .read = File{ .fd = fds[0], .pollable = true },
-        .write = File{ .fd = fds[1], .pollable = true },
+        .read = File{ .fd = fds[0], .streaming_route = .pollable },
+        .write = File{ .fd = fds[1], .streaming_route = .pollable },
     };
 }
 
@@ -152,16 +152,16 @@ pub fn stderr() File {
 /// all: both the overlapped streaming path and the positional file_read/
 /// file_write path would issue a blocking overlapped operation on the loop
 /// thread and stall every task. The only path that works is the thread pool's
-/// blocking ReadFile/WriteFile, reached by a streaming op with pollable=false.
-/// So force `pollable = false` (route to the thread pool) and `.streaming`
-/// (so the Reader/Writer issues streaming ops, never positional). This holds
-/// for consoles, inherited pipes, and file redirection alike. On POSIX the std
-/// handles behave like any other fd.
+/// blocking ReadFile/WriteFile, reached by a streaming op routed there. So
+/// route to the thread pool and set `.streaming` (so the Reader/Writer issues
+/// streaming ops, never positional). This holds for consoles, inherited pipes,
+/// and file redirection alike. On POSIX the std handles behave like any other
+/// fd.
 fn stdioFile(fd: Handle) File {
     if (builtin.os.tag == .windows) {
-        return .{ .fd = fd, .pollable = false, .preferred_mode = .streaming };
+        return .{ .fd = fd, .streaming_route = .thread_pool, .preferred_mode = .streaming };
     }
-    return .{ .fd = fd, .pollable = probePollable(fd) };
+    return .{ .fd = fd, .streaming_route = probeStreamingRoute(fd) };
 }
 
 pub fn stat(path: []const u8) Dir.StatError!os.fs.FileStatInfo {
@@ -201,7 +201,7 @@ pub const Dir = struct {
         var op = ev.FileOpen.init(self.fd, path, flags);
         try waitForIo(&op.c);
         const result = try op.getResult();
-        return .{ .fd = result.fd, .pollable = result.pollable };
+        return .{ .fd = result.fd, .streaming_route = result.streaming_route };
     }
 
     pub const CreateDirError = os.fs.DirCreateDirError || Cancelable;
@@ -218,7 +218,7 @@ pub const Dir = struct {
         var op = ev.FileCreate.init(self.fd, path, flags);
         try waitForIo(&op.c);
         const result = try op.getResult();
-        return .{ .fd = result.fd, .pollable = result.pollable };
+        return .{ .fd = result.fd, .streaming_route = result.streaming_route };
     }
 
     pub const CreateAtomicFileOptions = struct {
@@ -1203,23 +1203,23 @@ fn removeTempFile(dir: Dir, sub_path: []const u8) void {
 
 pub const File = struct {
     fd: Handle,
-    /// Whether `fd` is pollable (non-seekable) and can be driven by the event
-    /// loop for streaming I/O. Set from the open/create result; `null` when
-    /// unknown (e.g. constructed via `fromFd`). When false, streaming ops are
-    /// routed to the thread pool.
-    pollable: ?bool = null,
-    /// Explicit Reader/Writer `Mode` hint. `null` means infer from `pollable`.
-    /// Set when seekability and loop-drivability disagree (e.g. a Windows
-    /// console: non-seekable, so `.streaming`, but not loop-drivable).
+    /// How streaming I/O on `fd` reaches the OS. Set from the open/create
+    /// result; `null` when unknown (e.g. constructed via `fromFd`), in which
+    /// case the loop probes the handle on the first streaming op.
+    streaming_route: ?ev.StreamingRoute = null,
+    /// Explicit Reader/Writer `Mode` hint. `null` means infer from
+    /// `streaming_route`. Set when seekability and loop-drivability disagree
+    /// (e.g. a Windows console: non-seekable, so `.streaming`, but not
+    /// loop-drivable).
     preferred_mode: ?Mode = null,
 
     pub const ReadError = os.fs.FileReadError || Cancelable;
     pub const WriteError = os.fs.FileWriteError || Cancelable;
 
     /// Whether the Reader/Writer issues positional (offset-based) or streaming
-    /// (current-position) I/O ops. Independent of `File.pollable`, which decides
-    /// event-loop vs thread-pool routing: a console, for example, is `.streaming`
-    /// yet not loop-drivable.
+    /// (current-position) I/O ops. Independent of `File.streaming_route`, which
+    /// decides event-loop vs thread-pool routing: a console, for example, is
+    /// `.streaming` yet not loop-drivable.
     pub const Mode = enum {
         /// Use positional I/O (pread/pwrite) with explicit offset.
         positional,
@@ -1252,17 +1252,17 @@ pub const File = struct {
     }
 
     /// Fill `op` with a streaming read at the current file position. Carries
-    /// this file's `pollable` routing (event loop vs thread pool).
+    /// this file's streaming route (event loop vs thread pool).
     pub fn prepReadStreaming(self: File, op: *ev.FileReadStreaming, buf: ev.ReadBuf) void {
         op.* = ev.FileReadStreaming.init(self.fd, buf);
-        op.pollable = self.pollable;
+        op.streaming_route = self.streaming_route;
     }
 
     /// Fill `op` with a streaming write at the current file position. Carries
-    /// this file's `pollable` routing (event loop vs thread pool).
+    /// this file's streaming route (event loop vs thread pool).
     pub fn prepWriteStreaming(self: File, op: *ev.FileWriteStreaming, buf: ev.WriteBuf) void {
         op.* = ev.FileWriteStreaming.init(self.fd, buf);
-        op.pollable = self.pollable;
+        op.streaming_route = self.streaming_route;
     }
 
     /// Fill `op` with a stat of this file.
@@ -1471,14 +1471,11 @@ pub const File = struct {
 };
 
 /// Pick the Reader/Writer mode for a file: an explicit `preferred_mode` wins,
-/// otherwise infer from `pollable` (non-seekable -> streaming, seekable or
-/// unknown -> positional).
+/// otherwise infer from the streaming route (non-seekable -> streaming,
+/// seekable or unknown -> positional).
 pub fn resolveMode(file: File) File.Mode {
     if (file.preferred_mode) |m| return m;
-    return if (file.pollable) |p|
-        if (p) .streaming else .positional
-    else
-        .positional;
+    return if (file.streaming_route == .pollable) .streaming else .positional;
 }
 
 /// File reader that implements std.Io.Reader interface.
@@ -1948,7 +1945,7 @@ test "File: prep functions drive concurrent reads through a CompletionQueue" {
     file.close();
 }
 
-test "File: streaming prep carries the file's pollable routing" {
+test "File: streaming prep carries the file's streaming route" {
     var t = try TestDirFixture.init();
     defer t.deinit();
 
@@ -1959,14 +1956,10 @@ test "File: streaming prep carries the file's pollable routing" {
     var iov: [1]os.iovec_const = undefined;
     var op: ev.FileWriteStreaming = undefined;
     file.prepWriteStreaming(&op, .fromSlice("x", &iov));
-    try std.testing.expectEqual(file.pollable, op.pollable);
+    try std.testing.expectEqual(file.streaming_route, op.streaming_route);
 
-    // Streaming I/O on regular files is not supported on Windows; the prep
-    // itself is platform-independent, so only the submit half is gated.
-    if (builtin.os.tag != .windows) {
-        try waitForIo(&op.c);
-        try std.testing.expectEqual(1, try op.getResult());
-    }
+    try waitForIo(&op.c);
+    try std.testing.expectEqual(1, try op.getResult());
 
     file.close();
 }
@@ -1995,6 +1988,44 @@ test "File: streaming changes caller-owned descriptor flags only for epoll" {
     const flags_after = os.posix.system.fcntl(fds[1], os.posix.system.F.GETFL, @as(c_int, 0));
     try std.testing.expectEqual(.SUCCESS, os.posix.errno(flags_after));
     try std.testing.expectEqual(readiness_backend, flags_after & nonblocking != 0);
+}
+
+test "File: direct I/O descriptor flags" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+
+    var t = try TestDirFixture.init();
+    defer t.deinit();
+
+    const direct_mask: c_int = @bitCast(os.posix.system.O{ .DIRECT = true });
+    for ([_]bool{ false, true }) |resolve_beneath| {
+        for ([_]bool{ false, true }) |direct| {
+            const created = t.dir.createFile("direct.bin", .{
+                .read = true,
+                .direct = direct,
+                .resolve_beneath = resolve_beneath,
+            }) catch |err| switch (err) {
+                // openat2 is missing under qemu-user and on old kernels.
+                error.Unsupported => if (resolve_beneath) continue else return err,
+                // Some filesystems (tmpfs, overlayfs, ...) reject O_DIRECT with EINVAL.
+                error.Unexpected => if (direct) continue else return err,
+                else => return err,
+            };
+            defer created.close();
+            const opened = try t.dir.openFile("direct.bin", .{
+                .direct = direct,
+                .resolve_beneath = resolve_beneath,
+            });
+            defer opened.close();
+
+            // A successful aligned round-trip also works with buffered I/O.
+            // Inspect the descriptors to prove the requested mode was applied.
+            for ([_]File{ created, opened }) |file| {
+                const flags = os.posix.system.fcntl(file.fd, os.posix.system.F.GETFL, @as(c_int, 0));
+                try std.testing.expectEqual(.SUCCESS, os.posix.errno(flags));
+                try std.testing.expectEqual(direct, flags & direct_mask != 0);
+            }
+        }
+    }
 }
 
 test "File: direct I/O round-trip" {
@@ -2781,12 +2812,71 @@ test "Dir: resolve_beneath blocks parent escape" {
 
 extern "c" fn mkfifo(path: [*:0]const u8, mode: std.c.mode_t) c_int;
 
+test "File: canceling a blocking read of a synchronous Windows pipe interrupts the worker" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const w = os.windows;
+
+    // A pipe from CreatePipe is synchronous, like an inherited stdin, so the
+    // read runs as a blocking ReadFile on a thread-pool worker.
+    var read_end: w.HANDLE = undefined;
+    var write_end: w.HANDLE = undefined;
+    if (w.CreatePipe(&read_end, &write_end, null, 0) == w.FALSE) return error.Unexpected;
+    defer _ = w.CloseHandle(read_end);
+    defer _ = w.CloseHandle(write_end);
+
+    const rt = try Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+
+    const reader = struct {
+        fn call(handle: Handle, result: *(File.ReadStreamingError!usize)) void {
+            const file: File = .{ .fd = handle, .streaming_route = .thread_pool, .preferred_mode = .streaming };
+            var buf: [16]u8 = undefined;
+            var storage: [1]os.iovec = undefined;
+            result.* = file.readStreaming(.fromSlice(&buf, &storage));
+        }
+    };
+
+    // If the cancel never lands, unblock the read with data after 5s, so the
+    // test fails instead of hanging.
+    const Watchdog = struct {
+        write_end: w.HANDLE,
+        finished: std.atomic.Value(bool) = .init(false),
+        fired: std.atomic.Value(bool) = .init(false),
+
+        fn run(self: *@This()) void {
+            for (0..5000) |_| {
+                if (self.finished.load(.acquire)) return;
+                os.time.sleep(.fromMilliseconds(1));
+            }
+            self.fired.store(true, .release);
+            var n: w.DWORD = undefined;
+            _ = w.WriteFile(self.write_end, "x", 1, &n, null);
+        }
+    };
+    var watchdog: Watchdog = .{ .write_end = write_end };
+    const watchdog_thread = try std.Thread.spawn(.{}, Watchdog.run, .{&watchdog});
+
+    var result: File.ReadStreamingError!usize = 0;
+    var handle = try rt.spawn(reader.call, .{ read_end, &result });
+
+    // Let the worker reach the blocking read, then cancel. The loop resends the
+    // cancel each tick until the worker acknowledges.
+    try rt.sleep(.fromMilliseconds(50));
+    handle.cancel();
+    handle.join();
+    watchdog.finished.store(true, .release);
+    watchdog_thread.join();
+
+    try std.testing.expect(!watchdog.fired.load(.acquire));
+    try std.testing.expectError(error.Canceled, result);
+}
+
 test "Dir: canceling a blocking open interrupts the worker" {
     // Only exercises the thread-pool-delegated path (kqueue/poll and friends);
     // backends that open natively (io_uring) cancel via the backend instead, and
     // the SIGURG mechanism is POSIX-only.
     if (ev.Backend.capability(.file_open) != .no) return;
-    if (!os.syscall_cancel.enabled) return;
+    if (!os.syscall_cancel.uses_signal) return;
 
     // A FIFO opened O_RDONLY with no writer blocks in the worker's openat(). On
     // POSIX the open is unconditionally blocking (O_NONBLOCK is applied only

@@ -17,9 +17,16 @@
 //! harmless spurious `EINTR` that the syscall's retry loop swallows. No wrong
 //! cancellation is possible.
 //!
-//! POSIX only (libc `pthread_kill`). On Windows / WASI / single-threaded builds
-//! this degrades to no-ops, and the thread pool's queue-based cancellation is
-//! unaffected.
+//! On Windows the canceller calls `CancelSynchronousIo` on the worker's thread
+//! handle instead, which fails the blocked call with `ERROR_OPERATION_ABORTED`,
+//! the Windows counterpart of `EINTR`. A stale cancel aborts whatever I/O the
+//! worker is in at that moment, which retries just like on a stale signal. It
+//! only interrupts I/O, not waits, so on Windows the futex waits that use
+//! `Syscall.beginWait` are not interruptible. The thread handle is opened once
+//! per worker by `bindThread`.
+//!
+//! On WASI and single-threaded builds this degrades to no-ops, and the thread
+//! pool's queue-based cancellation is unaffected.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -27,9 +34,15 @@ const posix = @import("posix.zig");
 const thread = @import("thread.zig");
 const time = @import("time.zig");
 const Duration = @import("../time.zig").Duration;
+const windows = @import("windows.zig");
 
 /// Whether syscall cancellation is supported on this target.
-pub const enabled = builtin.os.tag != .windows and builtin.os.tag != .wasi and !builtin.single_threaded;
+pub const enabled = builtin.os.tag != .wasi and !builtin.single_threaded;
+
+/// Whether cancellation interrupts syscalls with `SIGURG`, which breaks any
+/// blocking syscall, waits included. Otherwise (Windows) only I/O is
+/// interruptible.
+pub const uses_signal = enabled and builtin.os.tag != .windows;
 
 /// `error.Canceled` unifies structurally with `common.Cancelable` (Zig errors are
 /// interned by name), so callers can mix the two freely.
@@ -60,27 +73,62 @@ pub const State = enum(u8) {
 /// Per-worker binding. Set by `Token.enter`, read by the syscall site.
 threadlocal var current: ?*Token = null;
 
+/// Windows: this thread's handle for `CancelSynchronousIo`, opened by
+/// `bindThread`. `null` on a thread that was never bound, where tokens still
+/// work but a blocked call runs to completion.
+threadlocal var thread_handle: ?windows.HANDLE = null;
+
+/// Prepare the calling thread to run cancelable syscalls. Call once when a
+/// worker thread starts, paired with `unbindThread` before it exits. Only
+/// Windows needs it, to open the thread handle `CancelSynchronousIo` takes.
+pub fn bindThread() void {
+    if (!enabled or uses_signal) return;
+    std.debug.assert(thread_handle == null);
+    var handle: windows.HANDLE = undefined;
+    const process = windows.GetCurrentProcess();
+    if (windows.DuplicateHandle(process, windows.GetCurrentThread(), process, &handle, windows.THREAD_TERMINATE, windows.FALSE, 0) != windows.FALSE) {
+        thread_handle = handle;
+    }
+}
+
+/// Release what `bindThread` opened. Call before the worker thread exits, after
+/// its last `Token.exit`.
+pub fn unbindThread() void {
+    if (!enabled or uses_signal) return;
+    if (thread_handle) |handle| _ = windows.CloseHandle(handle);
+    thread_handle = null;
+}
+
 /// Task-owned cancellation token. Created by the code that submits the blocking
 /// work (on the stack for `blockInPlace`, or as a field of `AnyBlockingTask`).
 pub const Token = struct {
     state: std.atomic.Value(State) = .init(.idle),
-    /// `pthread_self()` of the bound worker; `null` when no worker is bound.
-    /// Published before `state` can become `blocked`, so it is always valid when
-    /// the canceller observes `blocked` via an acquiring CAS.
+    /// `pthread_self()` (or on Windows, the `bindThread` handle) of the bound
+    /// worker; `null` when no worker is bound. Published before `state` can
+    /// become `blocked`, so it is always valid when the canceller observes
+    /// `blocked` via an acquiring CAS.
     handle: std.atomic.Value(?Handle) = .init(null),
+    /// Cancellers currently inside `signal()` that may be using `handle`.
+    /// `exit()` waits for it to drop to zero, so the bound worker thread, and
+    /// with it the `pthread_t` or Windows handle, stays alive while any
+    /// canceller can still pass the handle to `pthread_kill` or
+    /// `CancelSynchronousIo`. A worker thread can exit and be freed once it
+    /// returns from `exit()`.
+    signalers: std.atomic.Value(u32) = .init(0),
 
     // When disabled the field is never accessed, but it still has to have a
     // defined in-memory layout: `std.atomic.Value` is an extern struct, and only
     // a *pointer* optional has a guaranteed layout (null pointer), so the
     // disabled placeholder must be a pointer type, not `void`/an integer.
-    // (`std.c.pthread_t` is itself a pointer, which is why the enabled case works.)
-    const Handle = if (enabled) std.c.pthread_t else *anyopaque;
+    // (`std.c.pthread_t` and `HANDLE` are pointers, which is why the enabled
+    // cases work.)
+    const Handle = if (uses_signal) std.c.pthread_t else if (enabled) windows.HANDLE else *anyopaque;
 
     /// Bind the calling worker thread to this token. Call immediately before
     /// running the task's function.
     pub fn enter(self: *Token) void {
         if (!enabled) return;
-        self.handle.store(std.c.pthread_self(), .monotonic);
+        self.handle.store(if (uses_signal) std.c.pthread_self() else thread_handle, .monotonic);
         current = self;
     }
 
@@ -90,7 +138,10 @@ pub const Token = struct {
     pub fn exit(self: *Token) void {
         if (!enabled) return;
         current = null;
-        self.handle.store(null, .monotonic);
+        // Pairs with `signal()`: either the canceller loads `null`, or this
+        // load sees it counted and waits until it is done with the handle.
+        self.handle.store(null, .seq_cst);
+        while (self.signalers.load(.seq_cst) != 0) thread.yield();
     }
 
     /// Canceller side: request cancellation. Returns `true` if the worker is
@@ -123,7 +174,14 @@ pub const Token = struct {
         // Only meaningful while the worker is blocked-and-canceling; any other
         // state means it already woke up (or never was blocked).
         if (self.state.load(.acquire) != .blocked_canceling) return false;
-        const handle = self.handle.load(.monotonic) orelse return false;
+        _ = self.signalers.fetchAdd(1, .seq_cst);
+        defer _ = self.signalers.fetchSub(1, .release);
+        const handle = self.handle.load(.seq_cst) orelse return false;
+        if (!uses_signal) {
+            if (windows.CancelSynchronousIo(handle) != windows.FALSE) return false;
+            // NOT_FOUND: the worker has not entered the call yet, so try again.
+            return windows.GetLastError() == .NOT_FOUND;
+        }
         _ = std.c.pthread_kill(handle, sig);
         return true;
     }
@@ -168,7 +226,8 @@ pub const Syscall = struct {
         }
     }
 
-    /// Call when the syscall returns `EINTR`. If this token was canceled, finish
+    /// Call when the syscall returns `EINTR` (`ERROR_OPERATION_ABORTED` on
+    /// Windows). If this token was canceled, finish
     /// the region and return `error.Canceled`; otherwise the interrupt was
     /// spurious (or meant for another token) and the caller should retry.
     pub fn checkCancel(self: Syscall) Cancelable!void {
@@ -187,6 +246,15 @@ pub const Syscall = struct {
                 .idle, .canceled => unreachable,
             }
         }
+    }
+
+    /// Like `begin`, for a blocking wait (a futex) rather than I/O. On Windows a
+    /// wait cannot be interrupted, so this only reports a cancel that is already
+    /// pending, and the wait runs uncancelable.
+    pub fn beginWait() Cancelable!Syscall {
+        if (uses_signal) return begin();
+        try checkCanceled();
+        return .{ .token = null };
     }
 
     /// Close the syscall region on success or any non-`EINTR` error:
@@ -230,7 +298,7 @@ pub fn checkCanceled() Cancelable!void {
     if (tok.state.load(.monotonic) == .canceled) return error.Canceled;
 }
 
-const sig = if (enabled) std.c.SIG.URG else {};
+const sig = if (uses_signal) std.c.SIG.URG else {};
 
 // A mutex serializes the entire (count-check + prev_action-read/write + sigaction)
 // critical section so that concurrent install/uninstall calls cannot corrupt
@@ -247,7 +315,7 @@ var prev_action: posix.Sigaction = undefined;
 /// signals it sent itself; the watchdog holds a reference too, so both share
 /// the one handler instead of replacing each other's.
 pub fn installHandler() void {
-    if (!enabled) return;
+    if (!uses_signal) return;
     install_mutex.lock();
     defer install_mutex.unlock();
     if (install_count != 0) {
@@ -268,7 +336,7 @@ pub fn installHandler() void {
 
 /// Restore the previous `SIGURG` disposition once the last user uninstalls.
 pub fn uninstallHandler() void {
-    if (!enabled) return;
+    if (!uses_signal) return;
     install_mutex.lock();
     defer install_mutex.unlock();
     std.debug.assert(install_count > 0);
@@ -284,7 +352,7 @@ fn handler(_: posix.SIG, _: *const posix.siginfo_t, uc: ?*anyopaque) callconv(.c
 }
 
 test "syscall_cancel: signal interrupts a blocking read" {
-    if (!enabled) return;
+    if (!uses_signal) return;
 
     // End-to-end: a worker thread blocks in a real syscall (read on an empty
     // pipe), and another thread cancels it via the token. The read must return
@@ -343,4 +411,115 @@ test "syscall_cancel: signal interrupts a blocking read" {
 
     t.join();
     try std.testing.expectError(error.Canceled, w.result);
+}
+
+test "syscall_cancel: CancelSynchronousIo interrupts a blocking pipe read" {
+    if (!enabled or uses_signal) return;
+
+    // An anonymous pipe from CreatePipe is synchronous, like an inherited stdin,
+    // so ReadFile on its empty read end blocks the worker until canceled.
+    var read_end: windows.HANDLE = undefined;
+    var write_end: windows.HANDLE = undefined;
+    if (windows.CreatePipe(&read_end, &write_end, null, 0) == windows.FALSE) return error.Unexpected;
+    defer _ = windows.CloseHandle(read_end);
+    defer _ = windows.CloseHandle(write_end);
+
+    var token: Token = .{};
+
+    const Worker = struct {
+        token: *Token,
+        read_end: windows.HANDLE,
+        result: anyerror!void = undefined,
+        done: std.atomic.Value(bool) = .init(false),
+
+        fn run(self: *@This()) void {
+            bindThread();
+            defer unbindThread();
+            self.token.enter();
+            defer self.token.exit();
+            defer self.done.store(true, .release);
+
+            self.result = blk: {
+                const sc = Syscall.begin() catch |e| break :blk e;
+                defer sc.finish();
+                var buf: [1]u8 = undefined;
+                var n: windows.DWORD = undefined;
+                while (true) {
+                    if (windows.ReadFile(self.read_end, &buf, buf.len, &n, null) != windows.FALSE) break :blk error.UnexpectedData;
+                    switch (windows.GetLastError()) {
+                        .OPERATION_ABORTED => {
+                            sc.checkCancel() catch |e| break :blk e;
+                            continue;
+                        },
+                        else => break :blk error.Unexpected,
+                    }
+                }
+            };
+        }
+    };
+
+    var w: Worker = .{ .token = &token, .read_end = read_end };
+    const t = try std.Thread.spawn(.{}, Worker.run, .{&w});
+
+    while (token.state.load(.acquire) != .blocked) time.sleep(Duration.fromMicroseconds(1));
+
+    // Resend until the worker finishes. If the cancel never lands, unblock the
+    // read with data after 5s, so the test fails instead of hanging.
+    _ = token.cancel();
+    var waited: usize = 0;
+    while (!w.done.load(.acquire)) : (waited += 1) {
+        if (waited == 5000) {
+            var n: windows.DWORD = undefined;
+            _ = windows.WriteFile(write_end, "x", 1, &n, null);
+            break;
+        }
+        _ = token.signal();
+        time.sleep(Duration.fromMilliseconds(1));
+    }
+
+    t.join();
+    try std.testing.expectError(error.Canceled, w.result);
+}
+
+test "syscall_cancel: exit waits for a canceller that may be using the handle" {
+    if (!enabled) return;
+
+    // Stand in for a canceller that loaded the handle in `signal()` and was
+    // descheduled before calling `pthread_kill`/`CancelSynchronousIo`: the
+    // worker must not leave `exit()`, and so must not be able to exit its
+    // thread, until that canceller is done.
+    var token: Token = .{};
+
+    const Worker = struct {
+        token: *Token,
+        entered: std.atomic.Value(bool) = .init(false),
+        go: std.atomic.Value(bool) = .init(false),
+        exited: std.atomic.Value(bool) = .init(false),
+
+        fn run(self: *@This()) void {
+            bindThread();
+            defer unbindThread();
+            self.token.enter();
+            self.entered.store(true, .release);
+            while (!self.go.load(.acquire)) time.sleep(Duration.fromMicroseconds(10));
+            self.token.exit();
+            self.exited.store(true, .release);
+        }
+    };
+
+    var w: Worker = .{ .token = &token };
+    const t = try std.Thread.spawn(.{}, Worker.run, .{&w});
+    while (!w.entered.load(.acquire)) time.sleep(Duration.fromMicroseconds(10));
+
+    _ = token.signalers.fetchAdd(1, .seq_cst);
+    const had_handle = token.handle.load(.seq_cst) != null;
+    w.go.store(true, .release);
+    time.sleep(Duration.fromMilliseconds(20));
+    const exited_while_signaling = w.exited.load(.acquire);
+    _ = token.signalers.fetchSub(1, .release);
+    t.join();
+
+    try std.testing.expect(had_handle or !uses_signal);
+    try std.testing.expect(!exited_while_signaling);
+    try std.testing.expect(w.exited.load(.acquire));
 }

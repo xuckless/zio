@@ -23,6 +23,7 @@ const endShield = runtime_mod.endShield;
 const checkCancel = runtime_mod.checkCancel;
 
 const spawnTask = @import("task.zig").spawnTask;
+const CanceledStatus = @import("task.zig").CanceledStatus;
 const spawnBlockingTask = @import("blocking_task.zig").spawnBlockingTask;
 const Awaitable = @import("awaitable.zig").Awaitable;
 const Group = @import("group.zig").Group;
@@ -49,6 +50,7 @@ const process_impl = @import("process.zig");
 const zio_net = @import("net.zig");
 const zio_dns = @import("dns/root.zig");
 const fillBuf = @import("utils/writer.zig").fillBuf;
+const probePollable = @import("ev/backends/common.zig").probePollable;
 const MemoryPool = @import("utils/memory_pool.zig").MemoryPool;
 const zio_options = @import("options.zig").options;
 
@@ -59,40 +61,55 @@ const max_iovecs_len = 8;
 
 pub const debug_io: Io = .{ .userdata = null, .vtable = &vtable };
 
-/// Read the pollable-cache state from `File.Flags`.
+/// Read the streaming route cached in `file`'s flags.
 ///
 /// When hacks are enabled, the `nonblocking` bool byte is overloaded:
-///  - 0x01: known pollable (opened non-blocking)
-///  - 0xCC: known not pollable (cached from previous probe)
+///  - 0x01: pollable (opened non-blocking)
+///  - 0xCC: thread pool (cached from a previous probe)
+///  - 0xCF: a file the loop drives at its position (Windows IOCP)
 ///  - other: unknown (determine lazily)
-fn flagsReadPollable(flags: *const Io.File.Flags) ?bool {
+///
+/// Under `no_hacks`, `nonblocking` alone says whether the loop drives the
+/// handle. On IOCP that means the handle is overlapped and associated with the
+/// port, which is what std defines `nonblocking` to mean on Windows; whether it
+/// is a pipe or a file is then probed on each op.
+fn flagsReadRoute(file: Io.File) ?ev.StreamingRoute {
     if (zio_options.no_hacks) {
-        return if (flags.nonblocking) true else null;
+        if (!file.flags.nonblocking) return null;
+        if (comptime ev.backend == .iocp) {
+            return if (probePollable(file.handle)) .pollable else .loop_file;
+        }
+        return .pollable;
     }
-    return switch (@as(*const u8, @ptrCast(flags)).*) {
-        0x01 => true,
-        0xCC => false,
+    return switch (@as(*const u8, @ptrCast(&file.flags)).*) {
+        0x01 => .pollable,
+        0xCC => .thread_pool,
+        0xCF => .loop_file,
         else => null,
     };
 }
 
-/// Write the pollable verdict into `File.Flags`.
-fn flagsWritePollable(flags: *Io.File.Flags, pollable: bool) void {
+/// Write the streaming route into `File.Flags`.
+fn flagsWriteRoute(flags: *Io.File.Flags, route: ev.StreamingRoute) void {
     if (zio_options.no_hacks) {
-        flags.nonblocking = pollable;
+        flags.nonblocking = route != .thread_pool;
         return;
     }
-    @as(*u8, @ptrCast(flags)).* = if (pollable) 0x01 else 0xCC;
+    @as(*u8, @ptrCast(flags)).* = switch (route) {
+        .pollable => 0x01,
+        .thread_pool => 0xCC,
+        .loop_file => 0xCF,
+    };
 }
 
-/// Build a `std.Io.File` from a zio `fs.File`, carrying its pollable verdict in
+/// Build a `std.Io.File` from a zio `fs.File`, carrying its streaming route in
 /// the (possibly hack-encoded) flags so the std Reader/Writer picks the right
-/// streaming-vs-positional path. A `null` verdict is left unknown (probed
+/// streaming-vs-positional path. A `null` route is left unknown (probed
 /// lazily). Used by `fs.File.stdReader` / `fs.File.stdWriter`.
 pub fn zioFileToStd(file: zio_fs.File) Io.File {
     // nonblocking=false is the "unknown" encoding in both hack modes.
     var f: Io.File = .{ .handle = file.fd, .flags = .{ .nonblocking = false } };
-    if (file.pollable) |pollable| flagsWritePollable(&f.flags, pollable);
+    if (file.streaming_route) |route| flagsWriteRoute(&f.flags, route);
     return f;
 }
 
@@ -101,17 +118,26 @@ pub fn zioFileToStd(file: zio_fs.File) Io.File {
 /// Reader/Writer falls back to streaming.
 ///
 /// On Windows, IOCP-driven positional I/O only works on handles zio opened and
-/// associated with its completion port (their pollable verdict is recorded in
-/// the flags). A handle whose verdict is unknown here was not opened by us
-/// (e.g. an inherited stdio handle obtained via `std.Io.File.stdin()`); an
+/// associated with its completion port (their streaming route is recorded in
+/// the flags). Any other handle, whether its route is unknown (e.g. an
+/// inherited stdio handle obtained via `std.Io.File.stdin()`) or known to be
+/// `thread_pool` (zio's own stdio files), was not associated with the port; an
 /// overlapped ReadFile/WriteFile on it would block the loop thread or never
 /// complete. Reporting `Unseekable` makes the reader/writer switch to the
-/// streaming path, which routes to the thread pool's blocking I/O. This relies
-/// on the flag-smuggling tri-state, so it is disabled under `no_hacks`.
+/// streaming path, which routes to the thread pool's blocking I/O. With the
+/// poll backend only an unknown route is rejected, which relies on the
+/// flag-smuggling tri-state, so it is disabled there under `no_hacks`.
 fn positionalUnsupported(file: Io.File) bool {
     if (comptime builtin.os.tag != .windows) return false;
+    if (comptime ev.backend == .iocp) {
+        // Checks the flag directly: under `no_hacks`, `flagsReadRoute` would
+        // probe the handle, and only "driven by the loop" matters here.
+        if (zio_options.no_hacks) return !file.flags.nonblocking;
+        const route = flagsReadRoute(file) orelse return true;
+        return route == .thread_pool;
+    }
     if (zio_options.no_hacks) return false;
-    return flagsReadPollable(&file.flags) == null;
+    return flagsReadRoute(file) == null;
 }
 
 pub const Mode = enum { regular, blocking };
@@ -331,7 +357,7 @@ fn awaitOrCancel(any_future: *Io.AnyFuture, result: []u8, should_cancel: bool) v
         awaitable.cancel();
     }
 
-    _ = select.waitUntilComplete(awaitable);
+    select.waitUntilComplete(awaitable);
 
     @memcpy(result, awaitable.getResultSlice());
 
@@ -354,20 +380,41 @@ fn groupAsyncImpl(
     start: *const fn (context: *const anyopaque) void,
 ) void {
     if (userdata == null) {
-        start(context.ptr);
+        groupStartInline(context.ptr, start);
         return;
     }
     const rt, const mode = decodeUserdata(userdata);
     const g = Group.fromStd(group);
     switch (mode) {
         .regular => groupSpawnTask(g, rt, context, context_alignment, start, .auto) catch {
-            start(context.ptr);
+            groupStartInline(context.ptr, start);
         },
         .blocking => groupSpawnBlockingTask(g, rt, context, context_alignment, start, .{ .reserve_thread = true }) catch {
-            start(context.ptr);
-            return;
+            groupStartInline(context.ptr, start);
         },
     }
+}
+
+/// Runs a group task on the caller, for when it could not be spawned.
+///
+/// It then runs as the caller's task, so a cancel it takes was meant for the
+/// caller, and `Io.Group.async` drops the `error.Canceled` the function
+/// returns. Put the cancel back, so the caller's next cancelation point, or the
+/// next group task run here, reports it. A cancel the caller had taken before
+/// is left alone, as it is the caller's to handle.
+fn groupStartInline(context: *const anyopaque, start: *const fn (context: *const anyopaque) void) void {
+    const task = runtime_mod.getCurrentTaskOrNull() orelse return start(context);
+    const before: CanceledStatus = @bitCast(task.canceled_status.load(.acquire));
+    start(context);
+    const after: CanceledStatus = @bitCast(task.canceled_status.load(.acquire));
+    const taken_before = isUnderCancel(before) and before.pending_errors == 0;
+    if (isUnderCancel(after) and after.pending_errors == 0 and !taken_before) {
+        task.recancel();
+    }
+}
+
+fn isUnderCancel(status: CanceledStatus) bool {
+    return status.user_canceled or status.auto_canceled > 0;
 }
 
 fn groupConcurrentImpl(
@@ -530,7 +577,7 @@ fn fileReadStreamingImpl(
     if (count == 0) return 0;
 
     var op = ev.FileReadStreaming.init(stdIoHandleToZio(file.handle), .{ .iovecs = iovecs[0..count] });
-    op.pollable = flagsReadPollable(&file.flags);
+    op.streaming_route = flagsReadRoute(file);
     try timedWaitForIoClock(&op.c, timeout, clock);
     const n = op.getResult() catch |err| switch (err) {
         error.BrokenPipe, error.Unseekable => return error.Unexpected,
@@ -558,7 +605,7 @@ fn fileWriteStreamingImpl(
     const wbuf = ev.WriteBuf.fromSlices(slices[0..n], &iovecs);
 
     var op = ev.FileWriteStreaming.init(stdIoHandleToZio(file.handle), wbuf);
-    op.pollable = flagsReadPollable(&file.flags);
+    op.streaming_route = flagsReadRoute(file);
     try timedWaitForIoClock(&op.c, timeout, clock);
     return op.getResult() catch |err| switch (err) {
         error.Unseekable => error.Unexpected,
@@ -798,6 +845,13 @@ fn batchAwaitConcurrentImpl(userdata: ?*anyopaque, batch: *Io.Batch, timeout: Io
             },
             error.Canceled => {
                 batchCancelPending(batch, state);
+                // Operations that completed regardless are results the caller
+                // must see, so they are returned and the cancellation is left
+                // for the next cancellation point.
+                if (batch.completed.head != .none) {
+                    runtime_mod.recancel();
+                    return;
+                }
                 return error.Canceled;
             },
         };
@@ -836,7 +890,7 @@ fn initBatchOperation(data: *BatchCompletionData, operation: Io.Operation) *ev.C
                 stdIoHandleToZio(o.file.handle),
                 .{ .iovecs = data.file_read_streaming.iovecs[0..count] },
             );
-            data.file_read_streaming.op.pollable = flagsReadPollable(&o.file.flags);
+            data.file_read_streaming.op.streaming_route = flagsReadRoute(o.file);
             return &data.file_read_streaming.op.c;
         },
         .file_write_streaming => |*o| {
@@ -852,7 +906,7 @@ fn initBatchOperation(data: *BatchCompletionData, operation: Io.Operation) *ev.C
                 stdIoHandleToZio(o.file.handle),
                 wbuf,
             );
-            data.file_write_streaming.op.pollable = flagsReadPollable(&o.file.flags);
+            data.file_write_streaming.op.streaming_route = flagsReadRoute(o.file);
             return &data.file_write_streaming.op.c;
         },
         .device_io_control => |*o| {
@@ -1344,7 +1398,7 @@ fn dirCreateFileImpl(_: ?*anyopaque, dir: Io.Dir, sub_path: []const u8, options:
     const result = op.getResult() catch |err| return openErrToFileErr(err);
     var file: Io.File = undefined;
     file.handle = result.fd;
-    flagsWritePollable(&file.flags, result.pollable);
+    flagsWriteRoute(&file.flags, result.streaming_route);
     errdefer fileCloseImpl(null, &.{file});
     try applyOpenLock(file, options.lock, options.lock_nonblocking);
     return file;
@@ -1417,7 +1471,7 @@ fn dirOpenFileImpl(_: ?*anyopaque, dir: Io.Dir, sub_path: []const u8, options: I
     const result = op.getResult() catch |err| return openErrToFileErr(err);
     var file: Io.File = undefined;
     file.handle = result.fd;
-    flagsWritePollable(&file.flags, result.pollable);
+    flagsWriteRoute(&file.flags, result.streaming_route);
     errdefer fileCloseImpl(null, &.{file});
     try applyOpenLock(file, options.lock, options.lock_nonblocking);
     return file;
@@ -2048,6 +2102,7 @@ fn sleepImpl(_: ?*anyopaque, timeout: Io.Timeout) Io.Cancelable!void {
         return runtime_mod.yield();
     }
     var waiter: Waiter = .init();
+    defer waiter.deinit();
     // Nothing ever signals this waiter, so the timeout firing is the sleep
     // finishing.
     waiter.timedWaitClock(1, .fromStd(timeout), .fromStdTimeout(timeout), .allow_cancel) catch |err| switch (err) {
@@ -2185,6 +2240,10 @@ fn netListenIpImpl(_: ?*anyopaque, address: *const Io.net.IpAddress, options: Io
     }
 
     socket.bind(.{ .ip = zio_addr }) catch |err| return bindErrToListenErr(err);
+    // Accepted sockets inherit TCP_NODELAY from the listener.
+    if (options.mode == .stream and options.protocol == .tcp) {
+        socket.setNoDelay(true) catch {};
+    }
     socket.listen(options.kernel_backlog) catch |err| return listenErrToListenErr(err);
 
     return .{
@@ -2202,11 +2261,6 @@ fn netAcceptImpl(_: ?*anyopaque, server: Io.net.Socket.Handle, _: Io.net.Server.
         var peer_addr_len: os_net.socklen_t = @sizeOf(zio_net.Address);
 
         const handle = if (acceptNow(server, &peer_addr, &peer_addr_len)) |h| h else try acceptWait(server, &peer_addr, &peer_addr_len) orelse continue;
-
-        switch (peer_addr.any.family) {
-            os_net.AF.INET, os_net.AF.INET6 => os_net.setNoDelay(handle, true) catch {},
-            else => {},
-        }
 
         return .{
             .handle = handle,
@@ -2283,7 +2337,7 @@ fn acceptNow(server: Io.net.Socket.Handle, peer_addr: *zio_net.Address, peer_add
 /// connection was aborted before it was accepted; try again.
 fn acceptWait(server: Io.net.Socket.Handle, peer_addr: *zio_net.Address, peer_addr_len: *os_net.socklen_t) Io.net.Server.AcceptError!?ev.Backend.NetHandle {
     var op = ev.NetAccept.init(stdIoHandleToZio(server), &peer_addr.any, peer_addr_len);
-    try waitForIo(&op.c);
+    try common.waitForIoPreferInline(&op.c);
     return op.getResult() catch |err| switch (err) {
         error.ConnectionAborted => null,
         error.WouldBlock => return error.WouldBlock,
@@ -2590,7 +2644,7 @@ fn zioSendFlags(flags: Io.net.SendFlags) os_net.SendFlags {
 /// is part of the contract, so a caller that gets fewer than it passed
 /// re-submits the rest; that is what lets the batch path below send just one,
 /// and how this loop continues after a batch that came back short.
-fn netSendOpImpl(
+noinline fn netSendOpImpl(
     handle: Io.net.Socket.Handle,
     messages: []Io.net.OutgoingMessage,
     flags: Io.net.SendFlags,
@@ -2717,7 +2771,7 @@ fn decodeIncomingFlags(raw: u32) Io.net.IncomingMessage.Flags {
 
 const max_mmsg_slots = 64;
 
-fn netReceiveMmsg(
+noinline fn netReceiveMmsg(
     o: *const Io.Operation.NetReceive,
     timeout: time.Timeout,
     clock: time.Clock,
@@ -2978,15 +3032,12 @@ fn netWriteFileImpl(
     }
 
     // The reader's buffer is empty here, so the fallback loop can borrow it.
-    const buffer = file_reader.interface.buffer;
-    if (ev.Backend.capability(.net_send_file) != .yes and buffer.len == 0) return error.Unimplemented;
-
     var op = ev.NetSendFile.init(
         stdIoHandleToZio(handle),
         file_reader.file.handle,
         file_reader.pos,
         @backingInt(limit),
-        .{ buffer, &.{} },
+        .{ file_reader.interface.buffer, &.{} },
     );
     try waitForIo(&op.c);
     const n = op.getResult() catch |err| switch (err) {
@@ -3005,6 +3056,8 @@ fn netWriteFileImpl(
             }
             return error.Unimplemented;
         },
+        // std reads the file into the writer's buffer instead.
+        error.Unimplemented => return error.Unimplemented,
         error.InputOutput, error.IsDir, error.NotOpenForReading => |e| {
             file_reader.err = e;
             return error.ReadFailed;
@@ -3325,7 +3378,7 @@ test "io: progressParentFile reads ZIG_PROGRESS" {
     };
     const file = try result;
     try std.testing.expectEqual(fd, file.handle);
-    try std.testing.expectEqual(null, flagsReadPollable(&file.flags));
+    try std.testing.expectEqual(null, flagsReadRoute(file));
 }
 
 test "io: debug_io answers process paths without a runtime" {
@@ -4213,6 +4266,33 @@ test "io: net TCP sendFileAll sends buffered header and file range" {
     try handle.join();
 }
 
+test "io: net TCP sendFileAll sends a file through an unbuffered reader" {
+    const rt = try Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const Worker = struct {
+        fn run(io: Io, dir: Io.Dir) !void {
+            var data: [40_000]u8 = undefined;
+            for (&data, 0..) |*b, i| b.* = @intCast(i % 251);
+            const file = try dir.createFile(io, "sendfile", .{ .read = true });
+            defer file.close(io);
+            try file.writePositionalAll(io, &data, 0);
+            var file_reader = file.reader(io, &.{});
+
+            const received = try testSendFileOverTcp(io, "HDR", &file_reader, .unlimited);
+            defer std.testing.allocator.free(received);
+            try std.testing.expectEqualStrings("HDR", received[0..3]);
+            try std.testing.expectEqualSlices(u8, &data, received[3..]);
+        }
+    };
+
+    var handle = try rt.spawn(Worker.run, .{ rt.io(), tmp.dir });
+    try handle.join();
+}
+
 test "io: net TCP sendFileAll falls back to reading from a pipe" {
     // Windows pipes are never positional, so they don't reach the `Unseekable` path.
     if (builtin.os.tag == .windows) return error.SkipZigTest;
@@ -4745,10 +4825,12 @@ test "io: file positional read/write round-trip" {
 }
 
 test "io: file streaming read advances position and reports EOF" {
-    // On Windows, zio opens files with FILE_FLAG_OVERLAPPED (for IOCP). Such
-    // handles have no implicit file position: streaming I/O reads and moves
-    // the position the file object holds (os/fs.zig, windowsStreamingTransfer),
-    // which seeks move too.
+    // With the poll backend, Windows files are opened for synchronous I/O, and
+    // on such a handle a positional write (an OVERLAPPED with an offset) also
+    // moves the file pointer, so the writePositional below leaves it at the
+    // end and the streaming read sees EOF.
+    if (builtin.os.tag == .windows and ev.backend == .poll) return error.SkipZigTest;
+
     var t = try TestDirFixture.init();
     defer t.deinit();
     const io = t.rt.io();
@@ -4785,8 +4867,14 @@ test "io: file streaming write advances position and appends" {
     defer file.close(io);
 
     try std.testing.expectEqual(5, try file.writeStreaming(io, "HELLO", &.{}, 1));
-    try std.testing.expectEqual(6, try file.writeStreaming(io, "", &.{ " ", "WORLD" }, 1));
-    try std.testing.expectEqual(3, try file.writeStreaming(io, "", &.{"!"}, 3));
+
+    // A vectored write may be short (the IOCP backend writes one buffer per
+    // op), so the vectored part goes through the Writer, which writes the rest.
+    var write_buffer: [4]u8 = undefined;
+    var writer = file.writerStreaming(io, &write_buffer);
+    try writer.interface.writeAll(" WORLD");
+    try writer.interface.splatByteAll('!', 3);
+    try writer.interface.flush();
 
     try std.testing.expectEqual(14, try file.length(io));
 
@@ -5548,6 +5636,106 @@ test "io: group runs spawned tasks to completion" {
     try handle.join();
 }
 
+test "io: a cancel taken by a group task run on the caller reaches the caller" {
+    var failing: std.testing.FailingAllocator = .init(std.testing.allocator, .{});
+    const rt = try Runtime.init(failing.allocator(), .{});
+    defer rt.deinit();
+
+    const Test = struct {
+        canceled: std.atomic.Value(u32) = .init(0),
+        canceled_after: bool = false,
+
+        const Padding = [@import("task.zig").TaskPool.pool_item_size]u8;
+
+        fn sleeper(t: *@This(), io: Io, _: Padding) Io.Cancelable!void {
+            io.sleep(.fromSeconds(5), .awake) catch |err| {
+                _ = t.canceled.fetchAdd(1, .acq_rel);
+                return err;
+            };
+        }
+
+        fn worker(t: *@This(), io: Io, alloc: *std.testing.FailingAllocator) Io.Cancelable!void {
+            // With no memory for the tasks, the group runs them right here.
+            // They take too much for the task pool, so they are not taken
+            // from its free list, but allocated.
+            alloc.fail_index = alloc.alloc_index;
+            defer alloc.fail_index = std.math.maxInt(usize);
+            var group: Io.Group = .init;
+            group.async(io, sleeper, .{ t, io, undefined });
+            group.async(io, sleeper, .{ t, io, undefined });
+            group.await(io) catch |err| {
+                t.canceled_after = true;
+                return err;
+            };
+            io.checkCancel() catch |err| {
+                t.canceled_after = true;
+                return err;
+            };
+        }
+
+        fn run(t: *@This(), io: Io, alloc: *std.testing.FailingAllocator) !void {
+            var future = try io.concurrent(worker, .{ t, io, alloc });
+            try io.sleep(.fromMilliseconds(50), .awake);
+            try std.testing.expectError(error.Canceled, future.cancel(io));
+        }
+    };
+
+    var t: Test = .{};
+    var handle = try rt.spawn(Test.run, .{ &t, rt.io(), &failing });
+    try handle.join();
+    // The first task took the cancel, the second got it back, and so did the
+    // caller after them.
+    try std.testing.expectEqual(2, t.canceled.load(.acquire));
+    try std.testing.expect(t.canceled_after);
+}
+
+test "io: a group task run on the caller leaves a cancel the caller took alone" {
+    var failing: std.testing.FailingAllocator = .init(std.testing.allocator, .{});
+    const rt = try Runtime.init(failing.allocator(), .{});
+    defer rt.deinit();
+
+    const Test = struct {
+        slept: bool = false,
+        canceled_after: bool = false,
+
+        const Padding = [@import("task.zig").TaskPool.pool_item_size]u8;
+
+        fn sleeper(t: *@This(), io: Io, _: Padding) Io.Cancelable!void {
+            try io.sleep(.fromMilliseconds(10), .awake);
+            t.slept = true;
+        }
+
+        fn worker(t: *@This(), io: Io, alloc: *std.testing.FailingAllocator) Io.Cancelable!void {
+            // Take the cancel, and go on as if cleaning up after it.
+            io.sleep(.fromSeconds(5), .awake) catch {};
+
+            // As in the test above, the group runs the task right here.
+            alloc.fail_index = alloc.alloc_index;
+            defer alloc.fail_index = std.math.maxInt(usize);
+            var group: Io.Group = .init;
+            group.async(io, sleeper, .{ t, io, undefined });
+            group.await(io) catch {
+                t.canceled_after = true;
+            };
+            io.checkCancel() catch {
+                t.canceled_after = true;
+            };
+        }
+
+        fn run(t: *@This(), io: Io, alloc: *std.testing.FailingAllocator) !void {
+            var future = try io.concurrent(worker, .{ t, io, alloc });
+            try io.sleep(.fromMilliseconds(50), .awake);
+            try future.cancel(io);
+        }
+    };
+
+    var t: Test = .{};
+    var handle = try rt.spawn(Test.run, .{ &t, rt.io(), &failing });
+    try handle.join();
+    try std.testing.expect(t.slept);
+    try std.testing.expect(!t.canceled_after);
+}
+
 test "io: operateTimeout net_receive succeeds when data is ready" {
     const rt = try Runtime.init(std.testing.allocator, .{});
     defer rt.deinit();
@@ -5788,8 +5976,8 @@ test "io: operateTimeout net_receive times out when no data arrives" {
 }
 
 test "io: batch awaitAsync executes operations linearly" {
-    // file_read_streaming uses iovec which doesn't work on Windows regular files
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    // See the Windows poll note in the streaming read test above.
+    if (builtin.os.tag == .windows and ev.backend == .poll) return error.SkipZigTest;
 
     var t = try TestDirFixture.init();
     defer t.deinit();
@@ -6274,6 +6462,75 @@ test "io: batch cancel does not report canceled operations" {
         // slots must be available to `addAt` again
         batch.cancel(io);
         try std.testing.expect(batch.next() == null);
+    }
+}
+
+test "io: batch awaitConcurrent canceled while an operation completes keeps its result" {
+    const rt = try Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+    const io = rt.io();
+
+    var sock1 = try Io.net.IpAddress.bind(&.{ .ip4 = .loopback(0) }, io, .{ .mode = .dgram });
+    defer sock1.close(io);
+    var sock2 = try Io.net.IpAddress.bind(&.{ .ip4 = .loopback(0) }, io, .{ .mode = .dgram });
+    defer sock2.close(io);
+    var sender = try Io.net.IpAddress.bind(&.{ .ip4 = .loopback(0) }, io, .{ .mode = .dgram });
+    defer sender.close(io);
+
+    // Already waiting, so the receive can complete as soon as it is submitted.
+    try sender.send(io, &sock1.address, "hello");
+
+    const Outcome = struct {
+        result: Io.Batch.AwaitConcurrentError!void = error.ConcurrencyUnavailable,
+        completed: ?u32 = null,
+        // What the next cancellation point reports after the await returned.
+        after: ?anyerror = null,
+    };
+
+    const Receiver = struct {
+        fn run(receiver_io: Io, s1: Io.net.Socket.Handle, s2: Io.net.Socket.Handle, out: *Outcome) void {
+            var storage: [2]Io.Operation.Storage = undefined;
+            var batch: Io.Batch = .init(&storage);
+            defer batch.cancel(receiver_io);
+
+            var msg1: Io.net.IncomingMessage = .init;
+            var buf1: [16]u8 = undefined;
+            _ = batch.add(.{ .net_receive = .{ .socket_handle = s1, .message_buffer = (&msg1)[0..1], .data_buffer = &buf1, .flags = .{} } });
+            var msg2: Io.net.IncomingMessage = .init;
+            var buf2: [16]u8 = undefined;
+            _ = batch.add(.{ .net_receive = .{ .socket_handle = s2, .message_buffer = (&msg2)[0..1], .data_buffer = &buf2, .flags = .{} } });
+
+            // The wait sees the cancel before the receive's result is handed
+            // back, so the result shows up while the batch is being canceled.
+            var self_handle = runtime_mod.CancelHandle.current();
+            self_handle.requestCancel();
+            self_handle.deinit();
+
+            out.result = batch.awaitConcurrent(receiver_io, .none);
+            if (batch.next()) |completion| out.completed = completion.index;
+            // Only a normal return leaves the cancel for later; an
+            // error.Canceled return already delivered it.
+            if (out.result) |_| {
+                receiver_io.checkCancel() catch |err| {
+                    out.after = err;
+                };
+            } else |_| {}
+        }
+    };
+
+    var outcome: Outcome = .{};
+    var receiver = try rt.spawn(Receiver.run, .{ io, sock1.handle, sock2.handle, &outcome });
+    receiver.join();
+
+    // Either the cancel stopped both receives, or the datagram is reported
+    // and the cancel is left for the next cancellation point. A Canceled
+    // await never leaves a result behind.
+    if (outcome.result) |_| {
+        try std.testing.expectEqual(0, outcome.completed.?);
+        try std.testing.expectEqual(error.Canceled, outcome.after.?);
+    } else |err| {
+        try std.testing.expectEqual(error.Canceled, err);
+        try std.testing.expectEqual(null, outcome.completed);
     }
 }
 

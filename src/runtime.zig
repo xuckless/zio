@@ -27,6 +27,8 @@ const Timestamp = time.Timestamp;
 const Coroutine = @import("coro/coroutines.zig").Coroutine;
 const Context = @import("coro/coroutines.zig").Context;
 const StackPool = @import("coro/stack_pool.zig").StackPool;
+const StackCache = @import("coro/stack_pool.zig").StackCache;
+const StackInfo = @import("coro/stack.zig").StackInfo;
 const StackPoolConfig = @import("coro/stack_pool.zig").Config;
 const setupStackGrowth = @import("coro/stack.zig").setupStackGrowth;
 const cleanupStackGrowth = @import("coro/stack.zig").cleanupStackGrowth;
@@ -215,7 +217,7 @@ pub fn JoinHandle(comptime T: type) type {
             const awaitable = self.awaitable orelse return self.result;
 
             // Wait for completion
-            _ = select.waitUntilComplete(awaitable);
+            select.waitUntilComplete(awaitable);
 
             // Get result and release awaitable
             self.finishAwaitable(awaitable);
@@ -291,10 +293,27 @@ pub fn JoinHandle(comptime T: type) type {
             awaitable.cancel();
 
             // Wait for completion
-            _ = select.waitUntilComplete(awaitable);
+            select.waitUntilComplete(awaitable);
 
             // Get result and release awaitable
             self.finishAwaitable(awaitable);
+        }
+
+        /// Request cancellation without waiting for the task to complete.
+        /// The task sees `error.Canceled` at its next cancellation point.
+        ///
+        /// No-op if the task has already completed, after `join()` or `detach()`,
+        /// or if its cancellation was already requested.
+        pub fn requestCancel(self: *const Self) void {
+            const awaitable = self.awaitable orelse return;
+            if (awaitable.hasResult()) return;
+            awaitable.requestCancel();
+        }
+
+        /// Returns a handle that can cancel the task independently of this one,
+        /// from any task or thread. It must be released with `deinit()`.
+        pub fn cancelHandle(self: *const Self) CancelHandle {
+            return .init(self.awaitable);
         }
 
         /// Detach the task, allowing it to run in the background.
@@ -316,6 +335,67 @@ pub fn JoinHandle(comptime T: type) type {
         }
     };
 }
+
+/// A handle that can cancel a task without owning its result, from any task
+/// or thread. It keeps a reference to the task, so it stays valid after the
+/// task completes, and canceling it then is a no-op.
+///
+/// Obtained from `JoinHandle.cancelHandle()` or, by a task for itself, from
+/// `CancelHandle.current()`. Must be released with `deinit()`, before the
+/// runtime is deinitialized.
+pub const CancelHandle = struct {
+    awaitable: ?*Awaitable,
+
+    fn init(awaitable: ?*Awaitable) CancelHandle {
+        if (awaitable) |a| a.ref_count.incr();
+        return .{ .awaitable = awaitable };
+    }
+
+    /// Returns a handle to the currently running task.
+    /// Panics if called from a thread without an active executor context.
+    /// Not for the main task, which never completes.
+    pub fn current() CancelHandle {
+        const task = getCurrentTask();
+        std.debug.assert(task != &getCurrentExecutor().main_task);
+        return .init(&task.awaitable);
+    }
+
+    /// Release the reference to the task.
+    pub fn deinit(self: *CancelHandle) void {
+        const awaitable = self.awaitable orelse return;
+        awaitable.release();
+        self.awaitable = null;
+    }
+
+    /// Check if the task has completed.
+    pub fn isFinished(self: CancelHandle) bool {
+        const awaitable = self.awaitable orelse return true;
+        return awaitable.hasResult();
+    }
+
+    /// Request cancellation without waiting for the task to complete.
+    /// The task sees `error.Canceled` at its next cancellation point.
+    ///
+    /// No-op if the task has already completed, or if its cancellation was
+    /// already requested. A task may request its own cancellation.
+    pub fn requestCancel(self: CancelHandle) void {
+        const awaitable = self.awaitable orelse return;
+        if (awaitable.hasResult()) return;
+        awaitable.requestCancel();
+    }
+
+    /// Request cancellation and wait for the task to complete.
+    ///
+    /// No-op if the task has already completed. Must not be called by the task
+    /// on itself, which would wait forever; use `requestCancel()` for that.
+    pub fn cancel(self: CancelHandle) void {
+        const awaitable = self.awaitable orelse return;
+        if (awaitable.hasResult()) return;
+        if (getCurrentTaskOrNull()) |task| std.debug.assert(&task.awaitable != awaitable);
+        awaitable.cancel();
+        select.waitUntilComplete(awaitable);
+    }
+};
 
 // Generic data structures (private)
 const WaitNode = @import("utils/wait_queue.zig").WaitNode;
@@ -565,6 +645,10 @@ pub const Executor = struct {
     // executor forces an I/O poll.
     tick_task_count: u32 = 0,
 
+    // Spawns made by the running task since the executor last switched tasks;
+    // reset on every switch, see registerTask.
+    spawn_streak: u32 = 0,
+
     // How many quanta fit in tick_target_ns, re-estimated after each tick from
     // task_ns_ewma. Counting against this approximates a time-based poll
     // interval without reading the clock on the hot path.
@@ -608,7 +692,7 @@ pub const Executor = struct {
 
     stealing: Stealing = .{},
 
-    // Stacks and task allocations for tasks spawned here (owner only).
+    // Task allocations for tasks spawned here (owner only).
     spawn_cache: @import("task.zig").SpawnCache = .{},
 
     // Deferred cleanup for the task that just yielded away from this executor.
@@ -635,6 +719,11 @@ pub const Executor = struct {
     /// stacks are trimmed or they run again (`RuntimeOptions.idle_stack_trim`).
     idle_tasks: std.DoublyLinkedList = .{},
     idle_trim_timer: ev.Timer = ev.Timer.init(.{ .duration = .fromSeconds(1) }),
+
+    // This executor's private cache of free coroutine stacks, in front of the
+    // runtime's stack pool. Touched only by this executor's thread; see
+    // Runtime.acquireStack.
+    stack_cache: StackCache = .{},
 
     // The task currently executing on this executor, or null when we are running
     // scheduler code (the run loop, a context switch, a completion callback) rather
@@ -798,6 +887,7 @@ pub const Executor = struct {
         setCurrentExecutor(null);
         Coroutine.clearCurrent();
 
+        self.stack_cache.flush(&self.runtime.stack_pool);
         self.loop.deinit();
 
         cleanupStackGrowth();
@@ -810,6 +900,9 @@ pub const Executor = struct {
     fn stackPoolShrinkCallback(loop: *ev.Loop, c: *ev.Completion) void {
         const timer = c.cast(ev.Timer);
         const self: *Executor = @alignCast(@fieldParentPtr("stack_pool_shrink_timer", timer));
+        // Cached stacks count as in use; return them first so the shrink
+        // pass sees this executor's idle capacity as free.
+        self.stack_cache.flush(&self.runtime.stack_pool);
         self.runtime.stack_pool.shrink(loop.now());
     }
 
@@ -840,6 +933,14 @@ pub const Executor = struct {
         self.loop.setTimer(timer, timeout);
     }
 
+    /// Move a timer armed on this executor's loop to a new timeout. See
+    /// `Loop.rearmTimer`. A no-suspend region, see `loopAdd`.
+    pub fn loopRearmTimer(self: *Executor, timer: *ev.Timer, timeout: time.Timeout) bool {
+        self.no_suspend += 1;
+        defer self.no_suspend -= 1;
+        return self.loop.rearmTimer(timer, timeout);
+    }
+
     pub const YieldCancelMode = enum { allow_cancel, no_cancel };
 
     inline fn bump(self: *Executor, comptime field: []const u8, n: u64) void {
@@ -848,6 +949,10 @@ pub const Executor = struct {
 
     /// Aim to poll I/O roughly this often while running tasks back-to-back.
     const tick_target_ns = 100_000;
+    /// Tasks a busy ring takes from the shared overflow queue per check. Checks
+    /// come once per tick, so this caps how fast busy executors drain what full
+    /// rings spill; a fair share instead piles work behind a ring already busy.
+    const busy_overflow_batch = 3;
     /// Budget until the first measurement (Go's scheduler / tokio's event_interval).
     const initial_tick_budget = 61;
     /// Budget clamp: at least 2 to make progress between polls, capped so a
@@ -947,6 +1052,7 @@ pub const Executor = struct {
             self.current_task = &self.main_task;
             if (comptime diag.enabled) self.debug_diag.watch.beat(@intFromPtr(&self.main_task));
         }
+        defer self.spawn_streak = 0;
 
         // Process deferred cleanup (e.g. main task's park/reschedule)
         self.processCleanup();
@@ -966,6 +1072,7 @@ pub const Executor = struct {
             while (self.getNextTask()) |next_task| {
                 updateParentContext(next_task, &self.main_task.coro.context);
                 self.current_task = next_task;
+                self.spawn_streak = 0;
                 next_task.coro.step();
                 self.current_task = null;
                 self.processCleanup();
@@ -990,6 +1097,7 @@ pub const Executor = struct {
             if (migrates) self.updateBacklog(!self.run_queue.isEmpty());
             if (has_work) {
                 try self.loop.poll(.zero);
+                self.drainDispatched();
             } else {
                 // Parked waiting for work is not a stall (diag.Watchdog).
                 if (comptime diag.enabled) self.debug_diag.watch.idle.store(true, .monotonic);
@@ -1015,7 +1123,7 @@ pub const Executor = struct {
 
             // Retune the tick budget from this batch. Skipped when we may have
             // slept in parkAndSearch — sleep time would poison the estimate.
-            // The cached snapshot: every path above ends in a `loop.poll`,
+            // The cached snapshot: every path above runs a `loop.poll`,
             // which refreshes it on return.
             const tick_now = self.loop.now();
             // Skip the retune on the fresh-drain entry pass: tick_task_count
@@ -1241,15 +1349,15 @@ pub const Executor = struct {
         // spill (which doesn't wake the loop) can't put this executor to sleep.
         if (!self.run_queue.overflow.isEmpty()) {
             if (migrates) {
-                // The shared queue: a busy ring takes one task per check, which
-                // bounds an overflow task's wait while leaving the rest to the
-                // other executors; this executor is often its only consumer, as
-                // stealing takes from rings and armSearcher does nothing while
-                // nobody is idle. An empty ring takes a batch.
+                // The shared queue: a busy ring takes a few tasks per check,
+                // which bounds an overflow task's wait while leaving the rest
+                // to the other executors; this executor is often its only
+                // consumer, as stealing takes from rings and armSearcher does
+                // nothing while nobody is idle. An empty ring takes a batch.
                 if (self.run_queue.isEmpty()) {
                     _ = self.run_queue.refill(self.overflowBatch(), .block);
                 } else {
-                    _ = self.run_queue.refill(1, .try_only);
+                    _ = self.run_queue.refill(busy_overflow_batch, .try_only);
                 }
             } else {
                 // This executor's own queue, which nobody else drains: take
@@ -1472,6 +1580,21 @@ pub const Executor = struct {
     /// executor, and wake that executor's loop. Goes to the home executor's
     /// overflow queue: the shared one (migration on, any executor may run it) or
     /// the home executor's own (migration off, stays home).
+    /// Safe builds: count a wake from a thread that is not an executor of the
+    /// task's runtime, so `Runtime.deinit` can report one still in progress.
+    fn beginForeignWakeCheck(task: *AnyTask) ?*Runtime {
+        const rt = task.runtime;
+        if (getCurrentExecutorOrNull()) |exec| {
+            if (exec.runtime == rt) return null;
+        }
+        _ = rt.foreign_wakes.fetchAdd(1, .monotonic);
+        return rt;
+    }
+
+    fn endForeignWakeCheck(rt: ?*Runtime) void {
+        if (rt) |r| _ = r.foreign_wakes.fetchSub(1, .release);
+    }
+
     fn scheduleTaskRemote(self: *Executor, task: *AnyTask) void {
         std.debug.assert(task != &self.main_task);
 
@@ -1480,42 +1603,72 @@ pub const Executor = struct {
         self.runtime.armSearcher(null);
     }
 
-    /// Schedule a task for execution.
-    /// Atomically transitions task state to .ready and schedules it for execution.
+    /// Schedule a task for execution, recording the wake-up `kind` in its
+    /// state word in the same compare-and-swap that makes it ready.
+    ///
+    /// After that CAS the task is touched again only when this call moved it
+    /// from `.new` or `.waiting` to `.ready`: the task is then in no run queue
+    /// and cannot run until it is queued below, so it cannot finish under us.
+    /// When it was already `.ready`, the CAS is the last touch of the task,
+    /// which is what lets a waiter's wake-up be delivered without a
+    /// reference: the waiter may see it, return and finish right away.
+    ///
+    /// The main task is the exception: it is never queued, its executor runs
+    /// it as soon as it sees `.ready`, so it may already be running while the
+    /// code below wakes its executor. That is safe because the main task is
+    /// part of its executor, which outlives every waker.
+    ///
     /// May migrate the task to the current executor for cache locality.
-    pub fn scheduleTask(task: *AnyTask) void {
+    pub fn scheduleTask(task: *AnyTask, comptime kind: AnyTask.WakeKind) void {
+        const foreign_rt = if (compat.is_safe) beginForeignWakeCheck(task) else {};
+        defer if (compat.is_safe) endForeignWakeCheck(foreign_rt);
+
         var old = task.state.load(.acquire);
         while (true) {
+            var desired = kind.apply(old);
             switch (old.tag) {
-                // Task already finished (race between completion and cancel) - nothing to do
-                .finished => return,
-                // Task is in .ready state (running or about to park).
-                // Set the awaken bit as a park token; processCleanup.park will consume it
-                // and reschedule the task instead of transitioning to .waiting.
-                // The CAS runs even when the token is already set (rewriting the
-                // same value): a coalescing waker must still join the release
-                // sequence on `state`, or the parker's token-consume would not
-                // synchronize with it and the payload published before this wake
-                // (a notify count, a result) could be invisible to the recheck
-                // after the reschedule.
-                .ready => {
-                    const desired = AnyTask.State{ .tag = .ready, .awaken = true };
-                    if (task.state.cmpxchgWeak(old, desired, .acq_rel, .acquire)) |actual| {
-                        old = actual;
-                        continue;
-                    }
-                    return; // Awaken token set; task will handle it before/during next park
+                // A plain wake racing the task's completion: nothing to do. A
+                // wake-up never gets here, because every wait outwaits the
+                // wake-ups sent to it before its task can move on.
+                .finished => {
+                    std.debug.assert(kind == .none);
+                    return;
                 },
-                // Valid states to transition to .ready
-                .new, .waiting => {},
+                // Running or about to park: set the awaken bit as a park
+                // token; processCleanup.park consumes it and reschedules the
+                // task instead of transitioning it to .waiting. The CAS runs
+                // even when nothing changes: a coalescing waker must still
+                // join the release sequence on `state`, or the parker's
+                // token-consume would not synchronize with it and the payload
+                // published before this wake could be invisible to the
+                // recheck after the reschedule.
+                .ready => {
+                    std.debug.assert(kind != .start);
+                    desired.awaken = true;
+                },
+                // Not queued yet. Only the code spawning the task queues it;
+                // until then nothing else may, or the task could run, finish
+                // and be freed while its spawner still uses it. Any other wake
+                // here is a cancel, already recorded in the task's cancel
+                // status and seen once the task runs.
+                .new => {
+                    if (kind != .start) return;
+                    desired.tag = .ready;
+                    desired.awaken = false;
+                },
+                .waiting => {
+                    std.debug.assert(kind != .start);
+                    desired.tag = .ready;
+                    desired.awaken = false;
+                },
             }
-            const desired = AnyTask.State{ .tag = .ready, .awaken = false };
             if (task.state.cmpxchgWeak(old, desired, .acq_rel, .acquire)) |actual| {
                 old = actual;
                 continue;
             }
             break;
         }
+        if (old.tag == .ready) return;
 
         const home_exec = Executor.fromCoroutine(&task.coro);
 
@@ -1576,7 +1729,8 @@ pub const Executor = struct {
                     std.debug.assert(old.tag == .ready);
                     if (old.awaken) {
                         // Pre-woken: consume the token, keep .ready, and reschedule
-                        const desired = AnyTask.State{ .tag = .ready, .awaken = false };
+                        var desired = old;
+                        desired.awaken = false;
                         if (task.state.cmpxchgWeak(old, desired, .acq_rel, .acquire)) |actual| {
                             old = actual;
                             continue;
@@ -1584,11 +1738,13 @@ pub const Executor = struct {
                         self.scheduleTaskLocal(task);
                         return;
                     }
-                    // Normal: transition to .waiting. Listed first: once
-                    // .waiting, a waker may queue it, though only this
-                    // thread runs it (and unlists it) after.
+                    // Normal: transition to .waiting, keeping the wait's
+                    // wake fields. Listed first: once .waiting, a waker may
+                    // queue it, though only this thread runs it (and unlists
+                    // it) after.
                     self.listIdle(task);
-                    const desired = AnyTask.State{ .tag = .waiting, .awaken = false };
+                    var desired = old;
+                    desired.tag = .waiting;
                     if (task.state.cmpxchgWeak(old, desired, .acq_rel, .acquire)) |actual| {
                         self.unlistIdle(task);
                         old = actual;
@@ -1602,7 +1758,7 @@ pub const Executor = struct {
                 task.state.store(.{ .tag = .finished }, .release);
                 // Off the dump's list before its stack goes.
                 if (comptime diag.enabled) diag.TaskList.unlink(&task.debug_link);
-                task.releaseCoroLocal(self);
+                task.releaseCoro(self.runtime);
                 if (comptime diagnostics_enabled) _ = self.diag.finished.fetchAdd(1, .monotonic);
                 finishTask(&task.awaitable);
             },
@@ -1624,12 +1780,6 @@ pub const Executor = struct {
         return @max(floor, self.last_round);
     }
 
-    /// Spawns past the backpressure threshold between yields: `floor`, or
-    /// with `fast_accept` the `roundBudget`.
-    pub fn spawnBudget(self: *const Executor, floor: u32) u32 {
-        return if (zio_options.fast_accept) self.roundBudget(floor) else floor;
-    }
-
     /// Sends `task`, the current task on this executor, to the back of the
     /// run queue, and notes how many tasks ran before it came back
     /// (`roundBudget`). Not a cancellation point.
@@ -1649,6 +1799,7 @@ pub const Executor = struct {
         // path it is set to the target task just before the switch; on the fall-back
         // path it stays null and the run loop keeps it null until it steps a task.
         self.current_task = null;
+        self.spawn_streak = 0;
         if (self.getNextTask()) |next_task| {
             updateParentContext(next_task, &self.main_task.coro.context);
             self.current_task = next_task;
@@ -1909,6 +2060,7 @@ pub fn sleep(duration: Duration) Cancelable!void {
     // Nothing to time: don't arm a loop timer just to yield.
     if (duration.value == 0) return yield();
     var waiter: Waiter = .init();
+    defer waiter.deinit();
     // Nothing ever signals this waiter, so the timeout firing is the sleep
     // finishing.
     waiter.timedWait(1, .{ .duration = duration }, .allow_cancel) catch |err| switch (err) {
@@ -1945,6 +2097,14 @@ pub const Runtime = struct {
     worker_start: WorkerStart = .wait,
     workers_stopped: usize = 0,
     teardown: bool = false,
+    /// Wakes in progress from code zio runs on threads that are not its
+    /// executors, see `Waiter.signalExternal`. Unlike wakes from the
+    /// program's own threads, the program cannot stop these before `deinit`,
+    /// so `deinit` waits for them.
+    external_wakes: std.atomic.Value(u32) = .init(0),
+    /// Safe builds: wakes in progress on threads that are not executors of
+    /// this runtime, see `Executor.beginForeignWakeCheck`.
+    foreign_wakes: if (compat.is_safe) std.atomic.Value(u32) else void = if (compat.is_safe) .init(0) else {},
     metrics_monitor: ?std.Thread = null,
     metrics_stop: std.atomic.Value(u32) = .init(0),
     own_self: bool = false,
@@ -2013,7 +2173,7 @@ pub const Runtime = struct {
         if (comptime have_sig_pipe) sig_pipe_guard.acquire();
         errdefer if (comptime have_sig_pipe) sig_pipe_guard.release();
 
-        try self.thread_pool.init(allocator, options.thread_pool);
+        try self.thread_pool.init(options.thread_pool);
         errdefer self.thread_pool.deinit();
 
         try self.executors.ensureTotalCapacity(allocator, num_executors);
@@ -2124,6 +2284,23 @@ pub const Runtime = struct {
         self.worker_cond.broadcast();
     }
 
+    /// Count a wake from code zio runs on a thread that is not one of its
+    /// executors. Called before the wake makes its task ready, so whatever the
+    /// task does next, `deinit` included, sees the count.
+    pub fn beginExternalWake(self: *Runtime) void {
+        _ = self.external_wakes.fetchAdd(1, .monotonic);
+    }
+
+    /// End a wake counted by `beginExternalWake`, after its last touch of the
+    /// runtime.
+    pub fn endExternalWake(self: *Runtime) void {
+        _ = self.external_wakes.fetchSub(1, .release);
+    }
+
+    fn waitExternalWakes(self: *Runtime) void {
+        while (self.external_wakes.load(.acquire) != 0) os.thread.yield();
+    }
+
     /// Stop worker executors and join threads. Used by deinit() and init() error path.
     fn shutdownWorkers(self: *Runtime) void {
         // A worker whose run() fails retries until this is set.
@@ -2158,6 +2335,12 @@ pub const Runtime = struct {
             while (self.workers_stopped < running) {
                 self.worker_cond.wait(&self.worker_mutex);
             }
+            // Executors are about to be torn down; a thread still inside a
+            // wake would touch one after it is freed.
+            self.waitExternalWakes();
+            if (compat.is_safe and self.foreign_wakes.load(.acquire) != 0) {
+                @panic("Runtime.deinit: a thread outside the runtime is still waking a task; stop such threads before deinit");
+            }
             self.teardown = true;
             self.worker_cond.broadcast();
         }
@@ -2169,6 +2352,31 @@ pub const Runtime = struct {
         self.workers.deinit(self.allocator);
     }
 
+    /// Take a stack for a new coroutine: from the calling executor's cache
+    /// when the caller is one of this runtime's executors, otherwise straight
+    /// from the pool (user threads, callback threads, another runtime's
+    /// executor). The cache belongs to the calling thread, not to the executor
+    /// the task is placed on.
+    pub fn acquireStack(self: *Runtime) error{OutOfMemory}!StackInfo {
+        if (getCurrentExecutorOrNull()) |executor| {
+            if (executor.runtime == self) return executor.stack_cache.acquire(&self.stack_pool);
+        }
+        return self.stack_pool.acquire();
+    }
+
+    /// Return a coroutine's stack; the counterpart of `acquireStack`.
+    pub fn releaseStack(self: *Runtime, stack_info: StackInfo) void {
+        if (getCurrentExecutorOrNull()) |executor| {
+            if (executor.runtime == self) return executor.stack_cache.release(&self.stack_pool, stack_info);
+        }
+        self.stack_pool.release(stack_info);
+    }
+
+    /// Shut the runtime down and free it. Every task must have finished, and
+    /// every thread outside the runtime that wakes its tasks (by setting an
+    /// `Event`, sending on a channel, and so on) must have stopped doing so:
+    /// a wake still in progress can touch an executor after it is freed.
+    /// Safe builds panic when they catch either.
     pub fn deinit(self: *Runtime) void {
         const allocator = self.allocator;
 
@@ -2188,10 +2396,10 @@ pub const Runtime = struct {
             self.metrics_monitor = null;
         }
 
-        // Stop and join the thread pool first, while all executor loops are
-        // still alive. Thread-pool completion callbacks wake the owning loop
-        // (writing its eventfd), so the pool's worker threads must be fully
-        // joined before any loop is torn down. stop() leaves the pool object
+        // Stop the thread pool first, while all executor loops are still
+        // alive. Thread-pool completion callbacks wake the owning loop
+        // (writing its eventfd), so the pool's workers must all be done with
+        // it before any loop is torn down. stop() leaves the pool object
         // valid (in shutdown mode), so any late submissions from executors being
         // shut down are safely dropped.
         self.thread_pool.stop();
@@ -2199,15 +2407,7 @@ pub const Runtime = struct {
         // Stop worker executors and join threads (deinits their loops)
         self.shutdownWorkers();
 
-        // The main executor's spawn cache still holds stacks the pool counts
-        // as in use (the workers gave theirs back as they stopped).
-        if (self.options.enable_main_executor) self.main_executor.spawn_cache.drain(self);
-
-        // All tasks should be complete before deinit. A task holds its stack
-        // until it finishes, so the pool's count of stacks in use covers them.
-        std.debug.assert(self.stack_pool.in_use == 0);
-
-        // Clean up ThreadPool (worker threads already joined by stop()).
+        // Clean up ThreadPool (its workers were already done in stop()).
         self.thread_pool.deinit();
 
         // Worker executors clean themselves up via defer in runWorker.
@@ -2217,6 +2417,11 @@ pub const Runtime = struct {
         }
 
         self.executors.deinit(allocator);
+
+        // All tasks should be complete before deinit. A task holds its stack
+        // until it finishes, so the pool's count of stacks in use covers them
+        // (every executor's cache was flushed back by its deinit above).
+        std.debug.assert(self.stack_pool.in_use == 0);
 
         // Clean up stack pool
         self.stack_pool.deinit();
@@ -2695,7 +2900,7 @@ test "runtime: spawnBlocking runs on a machinery thread" {
 }
 
 test "runtime: spawnBlocking cancel interrupts a blocking syscall on the worker" {
-    if (!os.syscall_cancel.enabled) return error.SkipZigTest;
+    if (!os.syscall_cancel.uses_signal) return error.SkipZigTest;
 
     const runtime = try Runtime.init(std.testing.allocator, .{ .thread_pool = .{} });
     defer runtime.deinit();
@@ -2868,6 +3073,219 @@ test "runtime: shielded sleep is not cancelable" {
 
     // Ensure the sleep completed (took at least 50ms)
     try std.testing.expect(timer.read().toMilliseconds() >= 40);
+}
+
+test "runtime: JoinHandle.requestCancel does not wait for the task" {
+    const runtime = try Runtime.init(std.testing.allocator, .{});
+    defer runtime.deinit();
+
+    const sleepingTask = struct {
+        fn call(rt: *Runtime) !void {
+            try rt.sleep(.fromMilliseconds(1000));
+            return error.TestUnexpectedResult;
+        }
+    }.call;
+
+    var handle = try runtime.spawn(sleepingTask, .{runtime});
+    defer handle.cancel();
+
+    // Let the task park in its sleep.
+    try runtime.sleep(.fromMilliseconds(10));
+
+    handle.requestCancel();
+    try std.testing.expect(!handle.hasResult());
+
+    var timer = time.Stopwatch.start();
+    try std.testing.expectError(error.Canceled, handle.join());
+    try std.testing.expect(timer.read().toMilliseconds() <= 500);
+
+    // A no-op once the result was taken.
+    handle.requestCancel();
+}
+
+test "runtime: CancelHandle outlives the task" {
+    const runtime = try Runtime.init(std.testing.allocator, .{});
+    defer runtime.deinit();
+
+    const quickTask = struct {
+        fn call() i32 {
+            return 42;
+        }
+    }.call;
+
+    var handle = try runtime.spawn(quickTask, .{});
+    var cancel_handle = handle.cancelHandle();
+    defer cancel_handle.deinit();
+
+    try std.testing.expectEqual(42, handle.join());
+    try std.testing.expect(cancel_handle.isFinished());
+
+    // The task is done and its join handle released, but the reference held
+    // here keeps it valid: both are no-ops.
+    cancel_handle.requestCancel();
+    cancel_handle.cancel();
+}
+
+test "runtime: CancelHandle.current lets another task cancel this one" {
+    const Event = @import("sync/Event.zig");
+
+    const runtime = try Runtime.init(std.testing.allocator, .{ .executors = .exact(2) });
+    defer runtime.deinit();
+
+    const Shared = struct {
+        handle: CancelHandle = .{ .awaitable = null },
+        ready: Event = .init,
+    };
+
+    const sleepingTask = struct {
+        fn call(rt: *Runtime, shared: *Shared) !void {
+            shared.handle = .current();
+            shared.ready.set();
+            try rt.sleep(.fromMilliseconds(1000));
+            return error.TestUnexpectedResult;
+        }
+    }.call;
+
+    var shared: Shared = .{};
+    defer shared.handle.deinit();
+
+    var handle = try runtime.spawn(sleepingTask, .{ runtime, &shared });
+    defer handle.cancel();
+
+    try shared.ready.wait();
+
+    var timer = time.Stopwatch.start();
+    shared.handle.cancel();
+    try std.testing.expect(shared.handle.isFinished());
+    try std.testing.expect(timer.read().toMilliseconds() <= 500);
+    try std.testing.expectError(error.Canceled, handle.join());
+}
+
+test "runtime: CancelHandle.requestCancel racing the task's completion" {
+    const runtime = try Runtime.init(std.testing.allocator, .{ .executors = .exact(4) });
+    defer runtime.deinit();
+
+    const quickTask = struct {
+        fn call(finished: *std.atomic.Value(usize)) void {
+            _ = finished.fetchAdd(1, .release);
+        }
+    }.call;
+
+    const n = 1000;
+    var finished: std.atomic.Value(usize) = .init(0);
+    for (0..n) |_| {
+        var handle = try runtime.spawn(quickTask, .{&finished});
+        var cancel_handle = handle.cancelHandle();
+        // The handle's reference is now the only one keeping the task alive
+        // past its completion.
+        handle.detach();
+        cancel_handle.requestCancel();
+        cancel_handle.deinit();
+    }
+
+    while (finished.load(.acquire) < n) try runtime.sleep(.fromMilliseconds(1));
+}
+
+test "runtime: CancelHandle.requestCancel is idempotent" {
+    const runtime = try Runtime.init(std.testing.allocator, .{});
+    defer runtime.deinit();
+
+    const cleaningTask = struct {
+        fn call(rt: *Runtime) !void {
+            rt.sleep(.fromMilliseconds(1000)) catch |err| {
+                // Cleanup through a cancellation point is not canceled again.
+                try rt.sleep(.fromMilliseconds(1));
+                return err;
+            };
+            return error.TestUnexpectedResult;
+        }
+    }.call;
+
+    var handle = try runtime.spawn(cleaningTask, .{runtime});
+    defer handle.cancel();
+    var cancel_handle = handle.cancelHandle();
+    defer cancel_handle.deinit();
+
+    try runtime.sleep(.fromMilliseconds(10));
+    for (0..300) |_| cancel_handle.requestCancel();
+
+    try std.testing.expectError(error.Canceled, handle.join());
+}
+
+test "runtime: CancelHandle.requestCancel from a thread outside the runtime" {
+    const runtime = try Runtime.init(std.testing.allocator, .{});
+    defer runtime.deinit();
+
+    const sleepingTask = struct {
+        fn call(rt: *Runtime) !void {
+            try rt.sleep(.fromMilliseconds(1000));
+            return error.TestUnexpectedResult;
+        }
+    }.call;
+
+    var handle = try runtime.spawn(sleepingTask, .{runtime});
+    defer handle.cancel();
+    var cancel_handle = handle.cancelHandle();
+    defer cancel_handle.deinit();
+
+    try runtime.sleep(.fromMilliseconds(10));
+    const thread = try std.Thread.spawn(.{}, CancelHandle.requestCancel, .{cancel_handle});
+    thread.join();
+
+    try std.testing.expectError(error.Canceled, handle.join());
+}
+
+test "runtime: cancel keeps the caller's own cancellation" {
+    const Event = @import("sync/Event.zig");
+
+    const runtime = try Runtime.init(std.testing.allocator, .{});
+    defer runtime.deinit();
+
+    const slowCleanupTask = struct {
+        fn call(rt: *Runtime, cleaned_up: *bool) !void {
+            rt.sleep(.fromMilliseconds(1000)) catch |err| {
+                rt.beginShield();
+                defer rt.endShield();
+                try rt.sleep(.fromMilliseconds(50));
+                cleaned_up.* = true;
+                return err;
+            };
+            return error.TestUnexpectedResult;
+        }
+    }.call;
+
+    const cancelingTask = struct {
+        fn call(rt: *Runtime, ready: *Event, use_cancel_handle: bool) !void {
+            var cleaned_up = false;
+            var target = try rt.spawn(slowCleanupTask, .{ rt, &cleaned_up });
+            defer target.cancel();
+
+            ready.set();
+            // This task is canceled while it waits here.
+            if (use_cancel_handle) {
+                var cancel_handle = target.cancelHandle();
+                defer cancel_handle.deinit();
+                cancel_handle.cancel();
+            } else {
+                target.cancel();
+            }
+            if (!cleaned_up) return error.TestUnexpectedResult;
+
+            try checkCancel();
+            return error.TestUnexpectedResult;
+        }
+    }.call;
+
+    for ([_]bool{ false, true }) |use_cancel_handle| {
+        var ready: Event = .init;
+        var handle = try runtime.spawn(cancelingTask, .{ runtime, &ready, use_cancel_handle });
+        defer handle.cancel();
+
+        try ready.wait();
+        try runtime.sleep(.fromMilliseconds(10));
+        handle.requestCancel();
+        try std.testing.expectError(error.Canceled, handle.join());
+    }
 }
 
 test "runtime: recancel re-arms a delivered cancellation" {
@@ -3391,6 +3809,34 @@ test "runtime: wake-before-park awaken bit stress (single executor)" {
 
 test "runtime: wake-before-park awaken bit stress (two executors)" {
     try wakeBeforeParkStress(2);
+}
+
+test "runtime: stacks cached by executors stay bounded and return on deinit" {
+    const runtime = try Runtime.init(std.testing.allocator, .{
+        .executors = .exact(2),
+    });
+    // deinit asserts that every cached stack came back to the pool.
+    defer runtime.deinit();
+
+    const S = struct {
+        fn work() void {}
+    };
+
+    // Tasks spawned here finish on whichever executor runs them, so stacks
+    // flow from this thread's cache to the others' and back through the pool.
+    var group: Group = .init;
+    defer group.cancel();
+    for (0..500) |_| try group.spawn(S.work, .{});
+    try group.wait();
+
+    // Every task has finished; what is still checked out of the pool is
+    // what the executors keep in their caches, plus at most one stack per
+    // executor whose finish cleanup (where the stack is released) has not
+    // run yet: wait() returns when the last task is done, and the cleanup
+    // runs at that executor's next landing site.
+    const executors = runtime.executors.items.len;
+    const bound = executors * (runtime.options.stack_pool.local_cache + 1);
+    try std.testing.expect(runtime.stack_pool.in_use <= bound);
 }
 
 fn wakeBeforeParkStress(executor_count: u6) !void {

@@ -18,9 +18,9 @@ const registerGroupTask = @import("group.zig").registerGroupTask;
 const unregisterGroupTask = @import("group.zig").unregisterGroupTask;
 const os = @import("os/root.zig");
 const Timestamp = @import("time.zig").Timestamp;
-const StackInfo = @import("coro/stack.zig").StackInfo;
 const zio_options = @import("options.zig").options;
 const diag = @import("diag.zig");
+const compat = @import("compat.zig");
 
 pub const Closure = struct {
     start: Start,
@@ -214,6 +214,10 @@ pub const AnyTask = struct {
     /// On its spawn executor's live-task list for the task dump
     /// (src/diag.zig), from `create` until it finishes or is destroyed.
     debug_link: if (diag.enabled) diag.TaskLink else void = if (diag.enabled) .{} else {},
+    /// Which kinds of direct wait the task has open (see `Waiter`). Only kept
+    /// in safe builds, to check the nesting rules, and only accessed by the
+    /// task itself.
+    open_waits: if (compat.is_safe) OpenWaits else void = if (compat.is_safe) .{} else {},
 
     /// See `Options.debug_cancel`. Only accessed by the task itself.
     cancel_debug: if (zio_options.debug_cancel) CancelDebug else void = if (zio_options.debug_cancel) .{} else {},
@@ -245,23 +249,77 @@ pub const AnyTask = struct {
         if (zio_options.debug_cancel) self.cancel_debug.exempt -= 1;
     }
 
-    /// Task state and park token, packed into a single byte for atomic operations.
+    /// Task state, park token and the wake-ups of the task's waits, in one
+    /// word so that a wake-up and the wake are a single atomic step (see
+    /// `Executor.scheduleTask`). 32 bits, because not every target has a
+    /// 64-bit compare-and-swap.
     ///
     /// The `awaken` bit implements a NetBSD-style park token:
     /// - Set by wakers when the task is in `.ready` state (not yet parked)
     /// - Consumed by `processCleanup.park` to reschedule the task instead of
     ///   transitioning it to `.waiting` when the task was pre-woken
-    pub const State = packed struct(u8) {
+    ///
+    /// The wake-up fields belong to the task's direct waits (`Waiter`). A
+    /// wait notes the field when it starts and compares against that, so the
+    /// fields are never reset and the waiting task only ever reads them:
+    /// - `done` flips on the wake-up of an ordinary wait, which gets exactly
+    ///   one;
+    /// - `lock` flips on the wake-up of a `zio.Mutex` lock wait, which can be
+    ///   open inside an ordinary wait or a select;
+    /// - `timer` flips when an ordinary wait's timeout fires;
+    /// - `select` counts the wake-ups of a select, which can get several and
+    ///   must outwait all of them. It wraps; a select receives far fewer than
+    ///   its range (see `max_arms` in select.zig).
+    pub const State = packed struct(u32) {
         tag: Tag = .new,
         awaken: bool = false,
-        _: u4 = 0,
+        done: bool = false,
+        lock: bool = false,
+        timer: bool = false,
+        select: u16 = 0,
+        _: u10 = 0,
 
-        pub const Tag = enum(u3) {
+        pub const Tag = enum(u2) {
             new = 0,
             ready = 1,
             waiting = 2,
             finished = 3,
         };
+    };
+
+    /// What a wake changes in the state word besides making the task ready.
+    pub const WakeKind = enum {
+        /// A plain wake. The caller must own a reference to the task.
+        none,
+        /// The first queuing of a new task, by the code spawning it.
+        start,
+        /// The wake-up of the task's ordinary wait.
+        done,
+        /// The wake-up of the task's mutex lock wait.
+        lock,
+        /// The timeout of the task's ordinary wait fired.
+        timer,
+        /// A wake-up of the task's select.
+        select,
+
+        pub fn apply(comptime kind: WakeKind, state: State) State {
+            var new = state;
+            switch (kind) {
+                .none, .start => {},
+                .done => new.done = !new.done,
+                .lock => new.lock = !new.lock,
+                .timer => new.timer = !new.timer,
+                .select => new.select +%= 1,
+            }
+            return new;
+        }
+    };
+
+    pub const OpenWaits = packed struct(u8) {
+        ordinary: bool = false,
+        lock: bool = false,
+        select: bool = false,
+        _: u5 = 0,
     };
 
     pub inline fn fromAwaitable(awaitable: *Awaitable) *AnyTask {
@@ -338,10 +396,7 @@ pub const AnyTask = struct {
         // only costs one spurious reschedule at the next park.
         if (cancel_mode == .allow_cancel) {
             try self.checkCancel();
-            if (zio_options.debug_cancel and mode == .park and self.reportSwallowedCancel()) {
-                // Printing can suspend, and the task may have migrated.
-                executor = getCurrentExecutor();
-            }
+            if (zio_options.debug_cancel and mode == .park) self.reportSwallowedCancel();
         }
 
         // Set up deferred cleanup — state transition happens after context is saved
@@ -353,6 +408,10 @@ pub const AnyTask = struct {
         if (self == &executor.main_task) {
             // Main task enters the run loop instead of context switching
             executor.run(.until_ready) catch |err| {
+                // The main task is in the middle of a wait here, so logging
+                // must not open another one.
+                runtime.beginNoSuspend();
+                defer runtime.endNoSuspend();
                 std.log.err("Event loop error during yield: {}", .{err});
             };
         } else {
@@ -558,22 +617,45 @@ pub const AnyTask = struct {
     /// The task is about to park on a cancelable wait. If a cancellation was
     /// delivered earlier and is neither pending again nor shielded, whoever
     /// received the error.Canceled did not propagate it and the wait can block
-    /// forever. Reports the first occurrence per task; returns whether it did.
-    fn reportSwallowedCancel(self: *AnyTask) bool {
+    /// forever. Reports the first occurrence per task.
+    fn reportSwallowedCancel(self: *AnyTask) void {
         const d = &self.cancel_debug;
-        if (d.reported or d.exempt > 0) return false;
-        const trace = d.trace orelse return false;
+        if (d.reported or d.exempt > 0) return;
+        const trace = d.trace orelse return;
         const status: CanceledStatus = @bitCast(self.canceled_status.load(.acquire));
-        if (status.pending_errors > 0 or status.shield_count > 0) return false;
+        if (status.pending_errors > 0 or status.shield_count > 0) return;
         d.reported = true;
         _ = swallowed_cancels.fetchAdd(1, .monotonic);
+
+        // The task is in the middle of a wait, so printing must not open
+        // another one: inside the region it blocks the thread instead.
+        runtime.beginNoSuspend();
+        defer runtime.endNoSuspend();
 
         std.debug.print("zio: task {*} parks on a cancelable wait after error.Canceled was delivered and not propagated\n", .{self});
         std.debug.print("error.Canceled was delivered at:\n", .{});
         std.debug.dumpStackTrace(&trace);
         std.debug.print("the task is now parking at:\n", .{});
         std.debug.dumpCurrentStackTrace(.{ .first_address = @returnAddress() });
-        return true;
+    }
+
+    /// Like `cancel`, but a no-op once a user cancellation was requested, so any
+    /// number of callers can request it without queueing more errors.
+    pub fn requestCancel(self: *AnyTask) void {
+        var current = self.canceled_status.load(.acquire);
+        while (true) {
+            var status: CanceledStatus = @bitCast(current);
+            if (status.user_canceled) return;
+            status.user_canceled = true;
+            status.pending_errors += 1;
+            const new: u32 = @bitCast(status);
+            if (self.canceled_status.cmpxchgWeak(current, new, .acq_rel, .acquire)) |prev| {
+                current = prev;
+                continue;
+            }
+            break;
+        }
+        self.wake();
     }
 
     /// Cancel this task by setting canceled status and waking it if suspended.
@@ -583,9 +665,10 @@ pub const AnyTask = struct {
         }
     }
 
-    /// Wake this task (mark it as ready and schedule for execution).
+    /// Wake this task (mark it as ready and schedule for execution). The
+    /// caller must own a reference to the task.
     pub fn wake(self: *AnyTask) void {
-        Executor.scheduleTask(self);
+        Executor.scheduleTask(self, .none);
     }
 
     /// Return the coroutine's stack to the pool and retire its TSan fiber.
@@ -598,19 +681,7 @@ pub const AnyTask = struct {
     /// `allocation_len` marking the resources as already released.
     pub fn releaseCoro(self: *AnyTask, rt: *Runtime) void {
         if (self.coro.context.stack_info.allocation_len == 0) return;
-        rt.stack_pool.release(self.coro.context.stack_info);
-        self.coro.context.stack_info.allocation_len = 0;
-        self.coro.deinit();
-    }
-
-    /// `releaseCoro` on the executor the task finished on, from its finish
-    /// cleanup: the stack goes to the executor's spawn cache while it has
-    /// room, for the next task spawned there, without the pool's lock.
-    pub fn releaseCoroLocal(self: *AnyTask, executor: *Executor) void {
-        if (self.coro.context.stack_info.allocation_len == 0) return;
-        if (!executor.spawn_cache.putStack(self.coro.context.stack_info)) {
-            return self.releaseCoro(executor.runtime);
-        }
+        rt.releaseStack(self.coro.context.stack_info);
         self.coro.context.stack_info.allocation_len = 0;
         self.coro.deinit();
     }
@@ -685,13 +756,8 @@ pub const AnyTask = struct {
         };
 
         // Acquire stack from pool and initialize context. Nothing below can
-        // fail, so the acquired stack needs no errdefer release here. A task
-        // spawned on the executor running this code takes one from its
-        // spawn cache first.
-        self.coro.context.stack_info = if (runtime.getCurrentExecutorOrNull() == executor)
-            executor.spawn_cache.takeStack() orelse try executor.runtime.stack_pool.acquire()
-        else
-            try executor.runtime.stack_pool.acquire();
+        // fail, so the acquired stack needs no errdefer release here.
+        self.coro.context.stack_info = try executor.runtime.acquireStack();
 
         if (comptime @import("runtime.zig").diagnostics_enabled) _ = executor.diag.spawned.fetchAdd(1, .monotonic);
 
@@ -830,43 +896,58 @@ pub fn TaskLocal(comptime T: type) type {
 const getPlacementExecutor = @import("runtime.zig").getPlacementExecutor;
 const Placement = @import("runtime.zig").Placement;
 
-/// Ready-queue length past which a spawning task yields to let new tasks start.
+/// Spawns a task may make without switching out before it yields.
+const spawn_streak_limit = 13;
+/// With `fast_accept`: the ready-queue length past which a spawning task
+/// yields every `spawn_yield_burst` spawns, 64 at the least and more when
+/// the queue is longer (`Executor.roundBudget`).
 const spawn_yield_threshold = 13;
-/// Spawns past the threshold between those yields: each one by default; with
-/// `fast_accept`, 64 at the least, and more when the queue is longer
-/// (`Executor.roundBudget`).
-const spawn_yield_burst = if (zio_options.fast_accept) 64 else 1;
+const spawn_yield_burst = 64;
 
 /// Register a task with the runtime and schedule it for execution.
-/// Increments its reference count, adds the task to the runtime's task list,
-/// and schedules it on its executor.
 /// Returns error.RuntimeShutdown if the runtime is shutting down.
+///
+/// Once `scheduleTask` returns, another executor can run the task to the end
+/// and free it, and for a group task the caller holds no reference of its own.
+/// So nothing after that line reads the task. `rt` is the task's runtime:
+/// `spawnTask` creates the task on an executor of `rt`.
 pub fn registerTask(rt: *Runtime, task: *AnyTask) error{RuntimeShutdown}!void {
     if (rt.shutting_down.load(.acquire)) {
         return error.RuntimeShutdown;
     }
 
-    Executor.scheduleTask(task);
+    Executor.scheduleTask(task, .start);
 
     if (runtime.getCurrentExecutorOrNull()) |current_executor| {
-        if (current_executor.runtime == task.runtime) {
-            // Backpressure for spawn loops: once the ready queue grows past the
-            // threshold, yield every spawn_yield_burst spawns so new tasks
-            // start running instead of piling up (distinct from maybeYield's
-            // time-slice check). With `fast_accept`, not on every spawn: a
-            // queue long with other work (thousands of busy connections)
-            // would send an accept loop to the back of it after each
-            // connection, which held a pinned executor to ~70 accepts a
-            // second at 4096 connections; nor every 64 when the queue is much
-            // longer than that, which held one to ~900 a second at 25,000
-            // (`Executor.roundBudget`). Only needed when no other executor
-            // can steal the backlog.
-            if (!rt.stealingActive() and current_executor.run_queue.len() >= spawn_yield_threshold) {
-                current_executor.spawns_past_threshold += 1;
-                if (current_executor.spawns_past_threshold >= current_executor.spawnBudget(spawn_yield_burst)) {
-                    if (current_executor.current_task) |spawner| {
-                        current_executor.spawns_past_threshold = 0;
-                        current_executor.yieldForRound(spawner);
+        if (current_executor.runtime == rt) {
+            // Spawn backpressure: lets the new tasks start before the spawner
+            // piles up more. Only needed when no other executor can steal the
+            // backlog.
+            if (!rt.stealingActive()) {
+                if (current_executor.current_task) |spawner| {
+                    if (zio_options.fast_accept) {
+                        // Not after every few spawns: a queue long with other
+                        // work (thousands of busy connections) would send an
+                        // accept loop to the back of it after a handful of
+                        // connections, which held a pinned executor to ~70
+                        // accepts a second at 4096 connections; nor every 64
+                        // when the queue is much longer than that, which held
+                        // one to ~900 a second at 25,000. So past the
+                        // threshold, every `roundBudget` spawns (the tasks
+                        // that ran during the spawner's last trip to the back
+                        // of the queue, 64 at the least).
+                        if (current_executor.run_queue.len() >= spawn_yield_threshold) {
+                            current_executor.spawns_past_threshold += 1;
+                            if (current_executor.spawns_past_threshold >= current_executor.roundBudget(spawn_yield_burst)) {
+                                current_executor.spawns_past_threshold = 0;
+                                current_executor.yieldForRound(spawner);
+                            }
+                        }
+                    } else {
+                        current_executor.spawn_streak += 1;
+                        if (current_executor.spawn_streak >= spawn_streak_limit) {
+                            spawner.yield(.reschedule, .no_cancel);
+                        }
                     }
                 }
             }
@@ -942,33 +1023,19 @@ fn localCache(rt: *Runtime) ?*SpawnCache {
 }
 
 /// What tasks that ended on an executor leave behind for the next ones
-/// spawned there: their stacks and task allocations. Spawning a task and
-/// finishing one each took the runtime-wide stack pool's and task pool's
-/// locks, which every executor shares; with a task per request, that is
-/// millions of times a second across cores. Only the owning executor's
-/// thread touches its cache; what does not fit goes back to the pools, and
-/// the executor returns the rest when it stops (`drain`).
+/// spawned there: their task allocations. Spawning a task and finishing one
+/// each took the runtime-wide task pool's lock, which every executor shares;
+/// with a task per request, that is millions of times a second across cores.
+/// (Stacks have their own per-executor cache, `Executor.stack_cache`.) Only
+/// the owning executor's thread touches its cache; what does not fit goes
+/// back to the pool, and the executor returns the rest when it stops
+/// (`drain`).
 pub const SpawnCache = struct {
     pub const len = 32;
     const Item = @FieldType(TaskPool, "pool").ItemPtr;
 
-    stacks: [len]StackInfo = undefined,
-    stack_count: u8 = 0,
     tasks: [len]Item = undefined,
     task_count: u8 = 0,
-
-    fn takeStack(self: *SpawnCache) ?StackInfo {
-        if (self.stack_count == 0) return null;
-        self.stack_count -= 1;
-        return self.stacks[self.stack_count];
-    }
-
-    fn putStack(self: *SpawnCache, info: StackInfo) bool {
-        if (self.stack_count == len) return false;
-        self.stacks[self.stack_count] = info;
-        self.stack_count += 1;
-        return true;
-    }
 
     fn takeTask(self: *SpawnCache) ?[]align(Closure.task_alignment) u8 {
         if (self.task_count == 0) return null;
@@ -983,10 +1050,8 @@ pub const SpawnCache = struct {
         return true;
     }
 
-    /// Everything back to the runtime's pools.
+    /// Everything back to the runtime's task pool.
     pub fn drain(self: *SpawnCache, rt: *Runtime) void {
-        for (self.stacks[0..self.stack_count]) |info| rt.stack_pool.release(info);
-        self.stack_count = 0;
         rt.task_pool.mutex.lock();
         for (self.tasks[0..self.task_count]) |item| rt.task_pool.pool.destroy(item);
         rt.task_pool.mutex.unlock();
@@ -1249,4 +1314,28 @@ test "TaskLocal: unbound key reads back null" {
     var h = try rt.spawn(S.run, .{});
     defer h.cancel();
     try h.join();
+}
+
+test "registerTask: a cancel before the task is queued leaves the queuing to the spawner" {
+    const rt = try Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+
+    const S = struct {
+        fn start(_: *const anyopaque, _: *anyopaque) void {}
+    };
+
+    // What `spawnTask` does up to queuing the task: create it and take the
+    // reference the handle below owns.
+    const task = try AnyTask.create(try getPlacementExecutor(rt, .auto), 0, .@"1", &.{}, .@"1", .{ .regular = &S.start });
+    task.awaitable.ref_count.incr();
+    var handle: runtime.JoinHandle(void) = .{ .awaitable = &task.awaitable, .result = undefined };
+
+    // A cancel landing here, as a concurrent `Group.cancel` can, must not
+    // queue the task: it could then run, finish and be freed while the
+    // spawner still has to queue it.
+    task.cancel();
+    try std.testing.expectEqual(.new, task.state.load(.acquire).tag);
+
+    try registerTask(rt, task);
+    handle.join();
 }

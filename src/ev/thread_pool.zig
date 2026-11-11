@@ -10,15 +10,11 @@ const runtime = @import("../runtime.zig");
 const log = @import("../common.zig").log;
 
 pub const ThreadPool = struct {
-    allocator: std.mem.Allocator,
-
-    workers: std.ArrayList(Worker) = .empty,
-    workers_mutex: os.Mutex = .init(),
-    next_worker_id: u64 = 0,
-
     queue: Queue(Completion) = .{},
     queue_mutex: os.Mutex = .init(),
     queue_not_empty: os.Condition = .init(),
+    /// Signaled when `running_threads` drops to zero, for `stop()`.
+    all_done: os.Condition = .init(),
     queue_size: usize = 0,
     shutdown: bool = false,
 
@@ -26,17 +22,23 @@ pub const ThreadPool = struct {
     max_threads: usize,
 
     idle_timeout_ns: u64,
-    scale_threshold: usize,
 
+    /// Workers alive or being spawned, including those in `starting`. Workers
+    /// are detached, so this count is the only record of them: a worker drops
+    /// it as the very last thing it does with the pool, and `stop()` waits for
+    /// it to reach zero. Only changed under `queue_mutex`; atomic so it can be
+    /// observed without it.
     running_threads: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+    /// Workers parked waiting for work. Only changed under `queue_mutex`; atomic
+    /// so it can be observed without it.
     idle_threads: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+    /// Workers counted in `running_threads` that have not yet taken
+    /// `queue_mutex` for the first time. Each will take a queued job, so they
+    /// count as available capacity. Guarded by `queue_mutex`.
+    starting: usize = 0,
 
     /// Reserved jobs (see `Work.reserve_thread`) currently sitting in the queue,
-    /// each still needing a worker to pick it up. Guarded by `queue_mutex`, so it
-    /// is consistent with `idle_threads` and the queue when the spawn decision is
-    /// made. A reservation spawns a worker only when there aren't enough idle
-    /// workers to cover every pending reserved job — otherwise a parked worker
-    /// takes it, no new thread needed.
+    /// each still needing a worker to pick it up. Guarded by `queue_mutex`.
     reserved_pending: usize = 0,
 
     /// Reserved jobs currently occupying a worker (picked up, not yet finished).
@@ -51,30 +53,27 @@ pub const ThreadPool = struct {
         min_threads: usize = 0,
         max_threads: ?usize = null,
         idle_timeout_ms: u64 = 60_000,
-        scale_threshold: usize = 2,
     };
 
-    const Worker = struct {
-        worker_id: u64,
-        thread: std.Thread,
-    };
+    /// Default `max_threads`. Workers spend most of their time blocked in
+    /// syscalls, so this is a guard against runaway thread creation, not a
+    /// parallelism limit.
+    pub const default_max_threads = 512;
 
-    pub fn init(self: *ThreadPool, allocator: std.mem.Allocator, options: Options) !void {
+    pub fn init(self: *ThreadPool, options: Options) !void {
         // A max_threads of 0 (explicit, or implied by a single-threaded build)
         // disables the pool: work is executed inline in submit().
         const max_threads = if (builtin.single_threaded)
             0
         else
-            options.max_threads orelse (try std.Thread.getCpuCount()) * 2;
+            options.max_threads orelse default_max_threads;
 
         const min_threads = @min(options.min_threads, max_threads);
 
         self.* = .{
-            .allocator = allocator,
             .min_threads = min_threads,
             .max_threads = max_threads,
             .idle_timeout_ns = options.idle_timeout_ms * std.time.ns_per_ms,
-            .scale_threshold = options.scale_threshold,
         };
         errdefer self.deinit();
 
@@ -82,74 +81,85 @@ pub const ThreadPool = struct {
         // blocking syscalls. Refcounted; paired with deinit's uninstall.
         os.syscall_cancel.installHandler();
 
-        try self.workers.ensureTotalCapacity(allocator, max_threads);
-
         for (0..min_threads) |_| {
-            try self.spawnThread(false);
+            self.queue_mutex.lock();
+            self.reserveSpawn();
+            self.queue_mutex.unlock();
+            self.spawnThread() catch |err| {
+                self.cancelSpawn();
+                return err;
+            };
         }
     }
 
-    /// Spawn a worker thread. `forced` bypasses the `max_threads` cap, used for a
-    /// reservation that must add capacity beyond the configured maximum (the
-    /// extra worker is reaped back toward `min_threads` once idle, like any
-    /// other). Non-forced spawns (init, scale-up) respect the cap.
-    fn spawnThread(self: *ThreadPool, forced: bool) !void {
-        self.workers_mutex.lock();
-        defer self.workers_mutex.unlock();
+    /// Whether the jobs in the queue need another worker. Every queued job must
+    /// have a worker to run it, either a parked one or one already starting, so
+    /// none waits behind workers that may stay blocked indefinitely. A
+    /// regular job only gets a new worker within the cap; reserved jobs are
+    /// taken first and get one regardless. Called under `queue_mutex`.
+    fn needsSpawn(self: *ThreadPool) bool {
+        const available = self.idle_threads.load(.monotonic) + self.starting;
+        if (available < self.reserved_pending) return true;
+        // Ceiling is max_threads + reserved_running: reserved work is additive to
+        // the regular budget, so regular work can still scale to max_threads even
+        // when reserved jobs occupy workers.
+        const ceiling = self.max_threads + self.reserved_running.load(.monotonic);
+        return available < self.queue_size and self.running_threads.load(.monotonic) < ceiling;
+    }
 
-        if (!forced and self.workers.items.len >= self.max_threads + self.reserved_running.load(.monotonic)) return;
-
+    /// Count a worker about to be spawned, so later spawn decisions see it.
+    /// Called under `queue_mutex`.
+    fn reserveSpawn(self: *ThreadPool) void {
         _ = self.running_threads.fetchAdd(1, .monotonic);
-        errdefer _ = self.running_threads.fetchSub(1, .monotonic);
-
-        const worker_id = self.next_worker_id;
-        self.next_worker_id +%= 1;
-
-        // Reservations can push the worker count past the init-time capacity, so
-        // this must allocate on demand rather than assume capacity.
-        const worker = try self.workers.addOne(self.allocator);
-        errdefer _ = self.workers.pop();
-        worker.worker_id = worker_id;
-        worker.thread = try std.Thread.spawn(.{}, run, .{ self, worker_id });
+        self.starting += 1;
     }
 
-    fn removeThread(self: *ThreadPool, worker_id: u64, after_shutdown: bool) bool {
-        self.workers_mutex.lock();
-        defer self.workers_mutex.unlock();
+    /// Undo `reserveSpawn` when the thread could not be spawned. A job left
+    /// without a worker is retried by the next submit's spawn decision.
+    fn cancelSpawn(self: *ThreadPool) void {
+        self.queue_mutex.lock();
+        defer self.queue_mutex.unlock();
+        self.starting -= 1;
+        self.releaseThread();
+    }
 
-        const allow_removal = after_shutdown or self.workers.items.len > self.min_threads;
-        if (!allow_removal) return false;
-
-        for (self.workers.items, 0..) |*worker, i| {
-            if (worker.worker_id == worker_id) {
-                _ = self.workers.swapRemove(i);
-                _ = self.running_threads.fetchSub(1, .monotonic);
-                return true;
-            }
+    /// Drop one worker from `running_threads`, waking `stop()` when it was the
+    /// last. Called under `queue_mutex`.
+    fn releaseThread(self: *ThreadPool) void {
+        if (self.running_threads.fetchSub(1, .monotonic) == 1) {
+            self.all_done.broadcast();
         }
-        unreachable;
+    }
+
+    /// Spawn a detached worker thread, already counted by `reserveSpawn`. Must
+    /// not touch the pool after the spawn: once the worker runs, it can exit and
+    /// let `stop()` return before this function does.
+    fn spawnThread(self: *ThreadPool) !void {
+        const thread = try std.Thread.spawn(.{}, run, .{self});
+        thread.detach();
     }
 
     pub fn deinit(self: *ThreadPool) void {
-        // stop() has already joined all worker threads (it is idempotent, so
-        // calling it again here is safe if the caller did not stop() first).
+        // stop() has already waited for all workers to be done with the pool (it
+        // is idempotent, so calling it again here is safe if the caller did not
+        // stop() first).
         self.stop();
-        self.workers.deinit(self.allocator);
 
         // Pair with the install in init (refcounted; restores on the last pool).
         os.syscall_cancel.uninstallHandler();
     }
 
-    /// Stop the pool: drop any queued work, refuse new submissions, and join all
-    /// worker threads. After this returns, no worker thread exists, so no
-    /// completion callback can run anymore (callbacks wake the owning event
-    /// loop, so the loop must outlive the pool's threads). The pool object stays
-    /// valid until deinit(); submit() called after stop() drops the work.
+    /// Stop the pool: drop any queued work, refuse new submissions, and wait
+    /// until all workers are done with the pool. Their OS threads may still be
+    /// finishing their exit, but none of them touches the pool anymore, so no
+    /// completion callback can run (callbacks wake the owning event loop, so
+    /// the loop must outlive the pool's workers). The pool object stays valid
+    /// until deinit(); submit() called after stop() drops the work. Every
+    /// caller waits, including concurrent and repeated ones.
     pub fn stop(self: *ThreadPool) void {
-        {
-            self.queue_mutex.lock();
-            defer self.queue_mutex.unlock();
-            if (self.shutdown) return; // already stopped, threads already joined
+        self.queue_mutex.lock();
+        defer self.queue_mutex.unlock();
+        if (!self.shutdown) {
             self.shutdown = true;
             // Drop any queued (not-yet-started) work so it can't be removed and
             // completed later (e.g. by cancel()), which would invoke its
@@ -160,18 +170,10 @@ pub const ThreadPool = struct {
             self.queue_not_empty.broadcast();
         }
 
-        // Join all threads - they will remove themselves from the list.
-        // We need to keep joining until all workers are gone.
-        while (true) {
-            self.workers_mutex.lock();
-            const thread = if (self.workers.items.len > 0) self.workers.items[0].thread else null;
-            self.workers_mutex.unlock();
-
-            if (thread) |t| {
-                t.join();
-            } else {
-                break;
-            }
+        // A spawn reserved before `shutdown` was set is counted here too: its
+        // worker sees `shutdown` and exits, or `cancelSpawn` drops the count.
+        while (self.running_threads.load(.monotonic) > 0) {
+            self.all_done.wait(&self.queue_mutex);
         }
     }
 
@@ -206,45 +208,22 @@ pub const ThreadPool = struct {
         // among themselves, which only shows once a spawn has failed.
         if (work.reserve_thread) self.queue.pushFront(&work.c) else self.queue.push(&work.c);
         self.queue_size += 1;
-        const queued = self.queue_size;
+        if (work.reserve_thread) self.reserved_pending += 1;
 
-        // Decide, under queue_mutex, whether a reserved job needs a fresh worker.
-        // Both idle_threads and reserved_pending are only mutated while holding
-        // this lock, so the snapshot is race-free: a parked worker can't wake and
-        // claim work until we release the lock. Spawn only when the idle workers
-        // can't cover every pending reserved job; otherwise a parked worker takes
-        // it. This is the guarantee's headroom accounting — one spare (idle or
-        // freshly spawned) worker per outstanding reserved job.
-        var reservation_needs_spawn = false;
-        if (work.reserve_thread) {
-            self.reserved_pending += 1;
-            reservation_needs_spawn = self.idle_threads.load(.monotonic) < self.reserved_pending;
-        }
+        // Decided under queue_mutex, so the counts are consistent: a parked
+        // worker can't wake and claim work until we release the lock.
+        const spawn = self.needsSpawn();
+        if (spawn) self.reserveSpawn();
 
         self.queue_mutex.unlock();
         self.queue_not_empty.signal();
 
-        if (reservation_needs_spawn) {
-            // Forced: a reserved job may need capacity beyond max_threads. On
-            // failure the job stays queued (reserved_pending is dropped when a
-            // worker eventually picks it up) and runs once a worker frees up —
-            // the hard guarantee degrades, but nothing is lost.
-            self.spawnThread(true) catch |err| {
-                log.err("Failed to spawn reserved thread: {}", .{err});
-            };
-            return;
-        }
-
-        const running = self.running_threads.load(.monotonic);
-        const idle = self.idle_threads.load(.monotonic);
-        // Ceiling is max_threads + reserved_running: reserved work is additive to
-        // the regular budget, so regular work can still scale to max_threads even
-        // when reserved jobs occupy workers.
-        const ceiling = self.max_threads + self.reserved_running.load(.monotonic);
-        const should_spawn = running < self.min_threads or (idle == 0 and queued >= running * self.scale_threshold and running < ceiling);
-        if (should_spawn) {
-            self.spawnThread(false) catch |err| {
+        if (spawn) {
+            // On failure the job stays queued and runs once a worker frees up,
+            // or gets a worker from the next submit's spawn decision.
+            self.spawnThread() catch |err| {
                 log.err("Failed to spawn thread: {}", .{err});
+                self.cancelSpawn();
             };
         }
     }
@@ -290,37 +269,57 @@ pub const ThreadPool = struct {
         }
     }
 
-    fn run(self: *ThreadPool, worker_id: u64) void {
+    fn run(self: *ThreadPool) void {
         // A worker is runtime machinery for its whole life. That includes the
         // `spawnBlocking` user code it also runs: such code can block on the
         // stderr lock, and the task holding that lock may be parked on this very
         // pool, so waiting would starve the worker needed to release it. See
         // `runtime.ThreadRole`.
         runtime.setThreadRole(.machinery);
-        while (true) {
-            const shutdown = self.runTasks();
-            if (self.removeThread(worker_id, shutdown)) return;
-        }
-        unreachable;
+        os.syscall_cancel.bindThread();
+
+        self.queue_mutex.lock();
+        self.runTasks();
+        os.syscall_cancel.unbindThread();
+
+        // The worker is detached, and this is its last access to the pool:
+        // once the count is released and the mutex unlocked, `stop()` can
+        // return and the pool can be freed. Nothing may follow these two lines.
+        self.releaseThread();
+        self.queue_mutex.unlock();
     }
 
-    fn runTasks(self: *ThreadPool) bool {
-        self.queue_mutex.lock();
-        defer self.queue_mutex.unlock();
+    /// Run queued jobs until shutdown, or until the worker has been idle for
+    /// `idle_timeout_ns` and the pool has more than `min_threads` workers.
+    /// Called and returns with `queue_mutex` held.
+    fn runTasks(self: *ThreadPool) void {
+        self.starting -= 1;
 
+        var timed_out = false;
         while (!self.shutdown) {
             const c = self.queue.pop() orelse {
+                // Retire only with the queue seen empty under the lock: a job
+                // pushed as the wait timed out counted this worker as idle.
+                // The caller releases this worker's count while still holding
+                // the lock, so the next spawn decision already sees it gone.
+                if (timed_out and self.running_threads.load(.monotonic) > self.min_threads) {
+                    return;
+                }
+
                 _ = self.idle_threads.fetchAdd(1, .monotonic);
                 defer _ = self.idle_threads.fetchSub(1, .monotonic);
 
-                if (self.running_threads.load(.monotonic) >= self.min_threads) {
+                if (self.running_threads.load(.monotonic) > self.min_threads) {
                     const timeout: Timeout = .{ .duration = .fromNanoseconds(self.idle_timeout_ns) };
-                    self.queue_not_empty.timedWait(&self.queue_mutex, timeout) catch return false;
+                    self.queue_not_empty.timedWait(&self.queue_mutex, timeout) catch {
+                        timed_out = true;
+                    };
                 } else {
                     self.queue_not_empty.wait(&self.queue_mutex);
                 }
                 continue;
             };
+            timed_out = false;
             self.queue_size -= 1;
 
             const work = c.cast(Work);
@@ -361,6 +360,5 @@ pub const ThreadPool = struct {
                 completion_fn(work.completion_context, work);
             }
         }
-        return true;
     }
 };

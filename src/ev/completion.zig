@@ -18,6 +18,7 @@ const os = @import("../os/root.zig");
 const net = @import("../os/net.zig");
 const fs = @import("../os/fs.zig");
 const Timestamp = @import("../time.zig").Timestamp;
+const TimeInt = @import("../time.zig").TimeInt;
 const Timeout = @import("../time.zig").Timeout;
 const Clock = @import("../time.zig").Clock;
 
@@ -600,8 +601,35 @@ pub const Timer = struct {
     clock: Clock = .awake,
     deadline: Timestamp = .zero,
     heap: HeapNode(Timer) = .{},
+    /// The deadline the timer is due at, which `extend` moves later without
+    /// the heap knowing; `deadline` is never after it. The scan that finds
+    /// `deadline` passed re-inserts the timer at this one when it has not.
+    /// `closed` while the timer is not armed, and from when it is committed
+    /// to completing: a fire and an extension are decided by one CAS on this
+    /// word. Absent where it would not be lock-free.
+    extended: if (can_extend) std.atomic.Value(TimeInt) else void = if (can_extend) .init(closed) else {},
 
     pub const Error = Cancelable;
+
+    pub const closed: TimeInt = 1 << (@bitSizeOf(TimeInt) - 1);
+
+    /// 32-bit targets have no 64-bit atomics; `extend` always fails there.
+    pub const can_extend = @bitSizeOf(usize) >= @bitSizeOf(TimeInt);
+
+    /// Move an armed timer's deadline to `deadline`, a timestamp on its own
+    /// clock, without taking the loop's timer lock. Only later: returns
+    /// false, changing nothing, for an earlier deadline, or for a timer that
+    /// is not armed or has already been committed to fire or to be canceled.
+    /// A cancel requested before this but not yet processed still wins: the
+    /// extension succeeds and the timer completes with `error.Canceled`.
+    pub fn extend(timer: *Timer, deadline: Timestamp) bool {
+        if (!can_extend) return false;
+        var w = timer.extended.load(.monotonic);
+        while (true) {
+            if (w & closed != 0 or deadline.value < w or deadline.value & closed != 0) return false;
+            w = timer.extended.cmpxchgWeak(w, deadline.value, .monotonic, .monotonic) orelse return true;
+        }
+    }
 
     pub fn init(timeout: Timeout) Timer {
         return .{
@@ -945,6 +973,10 @@ pub const NetSend = struct {
 /// the `Fallback` state below: read a chunk from the file into `buf`, send it to
 /// the socket, repeat until EOF or `remaining` is exhausted. Socket short-writes
 /// drain the remaining buffer before the next read.
+///
+/// An error or cancel that ends the op after some bytes were sent finishes it
+/// with that count instead, since those bytes can't be taken back; a caller
+/// that tries again from there gets the error, with nothing sent.
 pub const NetSendFile = struct {
     c: Completion,
     result_private_do_not_touch: usize = undefined,
@@ -959,9 +991,10 @@ pub const NetSendFile = struct {
     remaining: usize,
     /// Up to two scratch buffers borrowed from the caller for the generic
     /// fallback loop. If both are non-empty the loop double-buffers (read into
-    /// one while sending the other); if only `bufs[0]` is non-empty it runs a
-    /// serial read-then-send loop. The two buffers may differ in size (e.g. the
-    /// writer's buffer and the reader's buffer). Unused by native backends.
+    /// one while sending the other); if only one is non-empty it runs a serial
+    /// read-then-send loop. The two buffers may differ in size (e.g. the
+    /// writer's buffer and the reader's buffer). Unused by native backends, so
+    /// both can be empty.
     bufs: [2][]u8,
 
     internal: BackendOpData(.net_send_file, "NetSendFileData") = .{},
@@ -1000,12 +1033,16 @@ pub const NetSendFile = struct {
         send_iov: [1]os.iovec_const = undefined,
     };
 
-    pub const Error = (net.SendError || fs.FileReadError) || Cancelable;
+    pub const Error = (net.SendError || fs.FileReadError) || Cancelable || error{
+        /// The backend cannot send the file with the buffers given, which
+        /// depends on the backend; both empty is enough on some. Nothing was
+        /// sent, and the caller can copy the file itself.
+        Unimplemented,
+    };
 
     /// `bufs` are borrowed for the generic fallback loop and must outlive the
     /// operation. Provide two non-empty buffers for double-buffering, or one
-    /// (with `bufs[1]` empty) for a serial loop. `bufs[0]` must be non-empty.
-    /// Native backends ignore `bufs`.
+    /// for a serial loop. Native backends ignore `bufs`, so both can be empty.
     pub fn init(handle: Backend.NetHandle, file: fs.fd_t, offset: u64, limit: usize, bufs: [2][]u8) NetSendFile {
         return .{
             .c = .init(.net_send_file),
@@ -1346,13 +1383,31 @@ pub const NetSendMmsg = struct {
     }
 };
 
-/// Result of a file open/create: the new fd plus whether it is pollable
-/// (non-seekable). The pollable verdict is determined when the backend opens the
-/// file via the thread pool (always false on backends with native open/streaming
-/// and on Windows), letting callers seed streaming ops without re-probing.
+/// How a streaming (current-position) read or write on a handle is carried
+/// out. Decided when zio opens the handle, or by probing a handle it did not
+/// open the first time a streaming op is submitted on it.
+pub const StreamingRoute = enum(u8) {
+    /// A non-seekable handle (pipe, socket, tty) the event loop drives: by
+    /// readiness on POSIX, by an overlapped operation at offset zero on IOCP.
+    pollable,
+    /// A seekable file the event loop drives itself at the file's own position.
+    /// Only the IOCP backend produces it, for files it opened and associated
+    /// with its completion port; other backends send seekable files to the
+    /// thread pool.
+    loop_file,
+    /// Blocking read/write on the thread pool: seekable files on backends
+    /// without a native path for them, and handles the loop cannot drive, such
+    /// as inherited standard handles on Windows.
+    thread_pool,
+};
+
+/// Result of a file open/create: the new fd plus its streaming route. The
+/// route is determined when the backend opens the file via the thread pool
+/// (`thread_pool` on backends with a native open), letting callers seed
+/// streaming ops without re-probing.
 pub const FileOpenResult = struct {
     fd: fs.fd_t,
-    pollable: bool = false,
+    streaming_route: StreamingRoute = .thread_pool,
 };
 
 /// State for file/dir operations delegated to the thread pool. This is Loop
@@ -1519,12 +1574,10 @@ pub const FileReadStreaming = struct {
     route: RouteData(.file_read_streaming) = .none,
     handle: fs.fd_t,
     buffer: ReadBuf,
-    /// Whether `handle` is pollable (non-seekable). `null` until classified by
-    /// capability resolution on first submission; backends with a readiness
-    /// path use the poll path when true and the thread pool when false. Callers
-    /// may seed a cached value to skip re-classification, and may read it back
-    /// afterwards.
-    pollable: ?bool = null,
+    /// How the operation reaches the OS. `null` until classified by capability
+    /// resolution on first submission. Callers may seed a value they know from
+    /// opening the handle to skip re-classification.
+    streaming_route: ?StreamingRoute = null,
 
     pub const Error = fs.FileReadError || Cancelable;
 
@@ -1549,12 +1602,10 @@ pub const FileWriteStreaming = struct {
     route: RouteData(.file_write_streaming) = .none,
     handle: fs.fd_t,
     buffer: WriteBuf,
-    /// Whether `handle` is pollable (non-seekable). `null` until classified by
-    /// capability resolution on first submission; backends with a readiness
-    /// path use the poll path when true and the thread pool when false. Callers
-    /// may seed a cached value to skip re-classification, and may read it back
-    /// afterwards.
-    pollable: ?bool = null,
+    /// How the operation reaches the OS. `null` until classified by capability
+    /// resolution on first submission. Callers may seed a value they know from
+    /// opening the handle to skip re-classification.
+    streaming_route: ?StreamingRoute = null,
 
     pub const Error = fs.FileWriteError || Cancelable;
 

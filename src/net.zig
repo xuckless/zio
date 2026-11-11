@@ -316,73 +316,81 @@ pub const IpAddress = extern union {
     }
 
     pub fn parseIp4(buf: []const u8, port: u16) !IpAddress {
+        return initIp4(try parseIp4Bytes(buf), port);
+    }
+
+    /// Dotted-decimal only: four octets, no signs, no leading zeros.
+    fn parseIp4Bytes(buf: []const u8) ![4]u8 {
         var addr: [4]u8 = undefined;
         var octets = std.mem.splitScalar(u8, buf, '.');
         var i: usize = 0;
         while (octets.next()) |octet| : (i += 1) {
             if (i >= 4) return error.InvalidIpAddress;
-            addr[i] = std.fmt.parseInt(u8, octet, 10) catch return error.InvalidIpAddress;
+            if (octet.len == 0 or octet.len > 3 or (octet.len > 1 and octet[0] == '0')) return error.InvalidIpAddress;
+            var value: u16 = 0;
+            for (octet) |c| {
+                if (!std.ascii.isDigit(c)) return error.InvalidIpAddress;
+                value = value * 10 + (c - '0');
+            }
+            if (value > 255) return error.InvalidIpAddress;
+            addr[i] = @intCast(value);
         }
         if (i != 4) return error.InvalidIpAddress;
-        return initIp4(addr, port);
+        return addr;
     }
 
+    /// RFC 4291 text form: eight groups of 1-4 hex digits, one `::` for one or
+    /// more zero groups, and an optional dotted IPv4 address as the last 32 bits.
     pub fn parseIp6(buf: []const u8, port: u16) !IpAddress {
+        var groups: [8]u16 = @splat(0);
+        var count: usize = 0;
+        var gap: ?usize = null;
+        var rest = buf;
+        if (std.mem.startsWith(u8, rest, "::")) {
+            gap = 0;
+            rest = rest[2..];
+        }
+        while (rest.len > 0) {
+            const end = std.mem.findScalar(u8, rest, ':') orelse rest.len;
+            const part = rest[0..end];
+            if (std.mem.findScalar(u8, part, '.') != null) {
+                if (end != rest.len or count > 6) return error.InvalidIpAddress;
+                const ip4 = try parseIp4Bytes(part);
+                groups[count] = @as(u16, ip4[0]) << 8 | ip4[1];
+                groups[count + 1] = @as(u16, ip4[2]) << 8 | ip4[3];
+                count += 2;
+                break;
+            }
+            if (part.len == 0 or part.len > 4 or count == 8) return error.InvalidIpAddress;
+            var value: u16 = 0;
+            for (part) |c| {
+                value = value << 4 | (std.fmt.charToDigit(c, 16) catch return error.InvalidIpAddress);
+            }
+            groups[count] = value;
+            count += 1;
+            rest = rest[end..];
+            if (rest.len == 0) break;
+            rest = rest[1..];
+            if (rest.len == 0) return error.InvalidIpAddress; // trailing ':'
+            if (rest[0] == ':') {
+                if (gap != null) return error.InvalidIpAddress;
+                gap = count;
+                rest = rest[1..];
+            }
+        }
+        if (gap) |g| {
+            if (count == 8) return error.InvalidIpAddress;
+            const tail = count - g;
+            @memmove(groups[8 - tail ..], groups[g..count]);
+            @memset(groups[g .. 8 - tail], 0);
+        } else if (count != 8) {
+            return error.InvalidIpAddress;
+        }
+
         var addr: [16]u8 = undefined;
-        var tail: [16]u8 = undefined;
-        var ip_slice: []u8 = addr[0..];
-
-        var x: u16 = 0;
-        var saw_any_digits = false;
-        var index: usize = 0;
-        var abbrv = false;
-
-        for (buf, 0..) |c, i| {
-            if (c == ':') {
-                if (!saw_any_digits) {
-                    if (abbrv) return error.InvalidIpAddress; // ':::'
-                    if (i != 0) abbrv = true;
-                    @memset(ip_slice[index..], 0);
-                    ip_slice = tail[0..];
-                    index = 0;
-                    continue;
-                }
-                if (index == 14) return error.InvalidIpAddress;
-                ip_slice[index] = @as(u8, @truncate(x >> 8));
-                index += 1;
-                ip_slice[index] = @as(u8, @truncate(x));
-                index += 1;
-
-                x = 0;
-                saw_any_digits = false;
-            } else {
-                const digit = std.fmt.charToDigit(c, 16) catch return error.InvalidIpAddress;
-                const ov = @mulWithOverflow(x, 16);
-                if (ov[1] != 0) return error.InvalidIpAddress;
-                x = ov[0];
-                const ov2 = @addWithOverflow(x, digit);
-                if (ov2[1] != 0) return error.InvalidIpAddress;
-                x = ov2[0];
-                saw_any_digits = true;
-            }
+        for (groups, 0..) |group, i| {
+            std.mem.writeInt(u16, addr[i * 2 ..][0..2], group, .big);
         }
-
-        if (!saw_any_digits and !abbrv) return error.InvalidIpAddress;
-        if (!abbrv and index < 14) return error.InvalidIpAddress;
-
-        if (index == 14) {
-            ip_slice[14] = @as(u8, @truncate(x >> 8));
-            ip_slice[15] = @as(u8, @truncate(x));
-        } else {
-            ip_slice[index] = @as(u8, @truncate(x >> 8));
-            index += 1;
-            ip_slice[index] = @as(u8, @truncate(x));
-            index += 1;
-            if (abbrv) {
-                @memcpy(addr[16 - index ..][0..index], ip_slice[0..index]);
-            }
-        }
-
         return initIp6(addr, port, 0, 0);
     }
 
@@ -396,22 +404,22 @@ pub const IpAddress = extern union {
 
     pub fn parseIpAndPort(name: []const u8) !IpAddress {
         // For IPv6: [addr]:port
-        if (std.mem.indexOf(u8, name, "[")) |_| {
-            const start = std.mem.indexOf(u8, name, "[") orelse return error.InvalidFormat;
-            const end = std.mem.indexOf(u8, name, "]") orelse return error.InvalidFormat;
-            const colon = std.mem.lastIndexOf(u8, name, ":") orelse return error.InvalidFormat;
-            if (colon <= end) return error.InvalidFormat;
-            const addr_str = name[start + 1 .. end];
-            const port_str = name[colon + 1 ..];
-            const port = try std.fmt.parseInt(u16, port_str, 10);
-            return parseIp6(addr_str, port);
+        if (std.mem.startsWith(u8, name, "[")) {
+            const end = std.mem.findScalar(u8, name, ']') orelse return error.InvalidFormat;
+            if (end + 1 >= name.len or name[end + 1] != ':') return error.InvalidFormat;
+            return parseIp6(name[1..end], try parsePort(name[end + 2 ..]));
         }
         // For IPv4: addr:port
         const colon = std.mem.lastIndexOf(u8, name, ":") orelse return error.InvalidFormat;
-        const addr_str = name[0..colon];
-        const port_str = name[colon + 1 ..];
-        const port = try std.fmt.parseInt(u16, port_str, 10);
-        return parseIp4(addr_str, port);
+        return parseIp4(name[0..colon], try parsePort(name[colon + 1 ..]));
+    }
+
+    /// Decimal digits only; std.fmt.parseInt would also take a sign and underscores.
+    fn parsePort(text: []const u8) !u16 {
+        for (text) |c| {
+            if (!std.ascii.isDigit(c)) return error.InvalidCharacter;
+        }
+        return std.fmt.parseInt(u16, text, 10);
     }
 
     /// Returns the port in native endian.
@@ -674,6 +682,8 @@ pub const IpAddress = extern union {
         }
 
         try socket.bind(.{ .ip = self });
+        // Accepted sockets inherit TCP_NODELAY from the listener.
+        socket.setNoDelay(true) catch {};
         try socket.listen(options.kernel_backlog);
 
         return .{ .socket = socket };
@@ -1217,6 +1227,11 @@ pub const Server = struct {
 
     /// Accepts the next incoming connection.
     ///
+    /// TCP connections come with Nagle's algorithm disabled. They inherit
+    /// that from the listener, which `IpAddress.listen` sets up; a listener
+    /// created some other way needs `setNoDelay` on the listening socket
+    /// before connections arrive.
+    ///
     /// `ConnectionAborted` is not reported: it means a connection sitting in the
     /// accept queue went away before we got to it, which says nothing about the
     /// listener, so the next connection is taken instead. The timeout covers the
@@ -1229,13 +1244,16 @@ pub const Server = struct {
             var peer_addr_len: os.net.socklen_t = @sizeOf(Address);
 
             var op = ev.NetAccept.init(self.socket.handle, &peer_addr.any, &peer_addr_len);
-            try timedWaitForIo(&op.c, deadline);
+            if (deadline == .none) {
+                try common.waitForIoPreferInline(&op.c);
+            } else {
+                try timedWaitForIo(&op.c, deadline);
+            }
             const handle = op.getResult() catch |err| switch (err) {
                 error.ConnectionAborted => continue,
                 else => |e| return e,
             };
             const address: Address = .fromPosix(&peer_addr.any, peer_addr_len);
-            if (address.getType() == .ip) os.net.setNoDelay(handle, true) catch {};
             return .{ .socket = .{ .handle = handle, .address = address } };
         }
     }
@@ -1435,9 +1453,8 @@ pub const Stream = struct {
             // Lend both the writer's and the reader's buffers to the fallback
             // loop; both are free here (any buffered bytes were flushed above).
             // The ev layer decides how to use them (double-buffer / split /
-            // serial). If neither is usable, defer to std's read/drain fallback.
+            // serial).
             const bufs: [2][]u8 = .{ io_w.buffer, file_reader.interface.buffer };
-            if (bufs[0].len == 0 and bufs[1].len == 0) return error.Unimplemented;
 
             // Stream the file body directly from the current read position.
             const want = @backingInt(limit);
@@ -1459,6 +1476,8 @@ pub const Stream = struct {
                     w.err = error.Canceled;
                     return error.WriteFailed;
                 },
+                // Defer to std's read/drain fallback.
+                error.Unimplemented => return error.Unimplemented,
                 // Errors unique to the file-read side; surface as ReadFailed.
                 error.InputOutput, error.IsDir, error.NotOpenForReading, error.Unseekable => return error.ReadFailed,
                 // Remaining errors are all part of the send-side set.
@@ -1507,6 +1526,52 @@ test "IpAddress: getFamily" {
 
     const ipv6 = try IpAddress.parseIp6("::1", 80);
     try std.testing.expectEqual(IpAddress.Family.ipv6, ipv6.getFamily());
+}
+
+test "IpAddress: parseIp accepts only valid addresses" {
+    const valid = [_]struct { []const u8, [16]u8 }{
+        .{ "::", @splat(0) },
+        .{ "1::", .{ 0, 1 } ++ @as([14]u8, @splat(0)) },
+        .{ "1:2:3:4:5:6:7::", .{ 0, 1, 0, 2, 0, 3, 0, 4, 0, 5, 0, 6, 0, 7, 0, 0 } },
+        .{ "::ffff:1.2.3.4", .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 1, 2, 3, 4 } },
+        .{ "64:ff9b::1.2.3.4", .{ 0, 0x64, 0xff, 0x9b, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 3, 4 } },
+        .{ "ABCD::ef", .{ 0xab, 0xcd } ++ @as([12]u8, @splat(0)) ++ .{ 0, 0xef } },
+    };
+    for (valid) |case| {
+        const addr = try IpAddress.parseIp(case[0], 0);
+        try std.testing.expectEqual(case[1], addr.in6.addr);
+    }
+
+    const invalid = [_][]const u8{
+        "01.2.3.4",          "1.2.3.+4",              "1.2.3.04", "256.1.1.1",
+        "::1:2:3:4:5:6:7:8", "1:2:3:4:5:6:7:8::",     ":1::2",    "1::2:",
+        "00001::",           "1:2::3:4::5",           ":::",      "1::2.3.4.5:6",
+        "::ffff:01.2.3.4",   "1:2:3:4:5:6:7:1.2.3.4",
+    };
+    for (invalid) |text| {
+        try std.testing.expectError(error.InvalidIpAddress, IpAddress.parseIp(text, 0));
+    }
+}
+
+test "IpAddress: parseIpAndPort rejects text around the address and loose ports" {
+    for ([_][]const u8{ "x[::1]y:80", "[::1]]:80", "[::1]x:80", "[::1]:8_0", "1.2.3.4:+80", "[::1]:", "[::1]" }) |text| {
+        try std.testing.expect(std.meta.isError(IpAddress.parseIpAndPort(text)));
+    }
+}
+
+test "IpAddress: parseIpAndPort reads what format writes" {
+    for ([_][]const u8{ "1.2.3.4", "::ffff:1.2.3.4", "fe80::1", "::" }) |text| {
+        const addr = try IpAddress.parseIp(text, 8080);
+        var buf: [64]u8 = undefined;
+        const printed = try std.fmt.bufPrint(&buf, "{f}", .{addr});
+        const parsed = try IpAddress.parseIpAndPort(printed);
+        try std.testing.expectEqual(addr.getFamily(), parsed.getFamily());
+        try std.testing.expectEqual(addr.getPort(), parsed.getPort());
+        switch (addr.getFamily()) {
+            .ipv4 => try std.testing.expectEqual(addr.in.addr, parsed.in.addr),
+            .ipv6 => try std.testing.expectEqual(addr.in6.addr, parsed.in6.addr),
+        }
+    }
 }
 
 test "tcpConnectToAddress: basic" {
@@ -2002,6 +2067,133 @@ test "Stream.Writer.sendFile cancellation unblocks a stalled transfer" {
     try std.testing.expect(outcome.completed);
     try std.testing.expectEqual(error.WriteFailed, outcome.send_err.?);
     try std.testing.expectEqual(error.Canceled, outcome.writer_err.?);
+}
+
+test "Stream.Writer.sendFile reports the bytes sent before a cancellation" {
+    const Io = std.Io;
+    const path = "test-native-sendfile-cancel-progress";
+
+    const runtime = try Runtime.init(std.testing.allocator, .{ .thread_pool = .{} });
+    defer runtime.deinit();
+    const io = runtime.io();
+
+    // Much larger than the socket buffers, which both ends pin small, so the
+    // send stalls partway once they fill and the peer never reads.
+    const total = 4 * 1024 * 1024;
+    {
+        var f = try Io.Dir.cwd().createFile(io, path, .{ .truncate = true });
+        defer f.close(io);
+        var fw_buf: [4096]u8 = undefined;
+        var fw = f.writer(io, &fw_buf);
+        const zeros: [4096]u8 = @splat(0);
+        var written: usize = 0;
+        while (written < total) : (written += zeros.len) {
+            try fw.interface.writeAll(&zeros);
+        }
+        try fw.interface.flush();
+    }
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const Outcome = struct {
+        completed: bool = false,
+        send_result: anyerror!usize = error.Unexpected,
+        pos: u64 = 0,
+        // What the next cancellation point reports after the send returned.
+        after: ?anyerror = null,
+    };
+
+    // Reads the first chunk and reports its size, so the sender is known to
+    // be partway through. Then stops reading, so the send stalls, until told
+    // to drain the rest, and reports the total it received. A failure is
+    // reported in place of either, so the test fails instead of waiting.
+    const ServerTask = struct {
+        fn run(server_port: *Channel(u16), events: *Channel(anyerror!usize), drain: *Channel(void)) void {
+            serve(server_port, events, drain) catch |err| {
+                events.send(err) catch return;
+            };
+        }
+
+        fn serve(server_port: *Channel(u16), events: *Channel(anyerror!usize), drain: *Channel(void)) !void {
+            const addr = try IpAddress.parseIp4("127.0.0.1", 0);
+            const server = try addr.listen(.{});
+            defer server.close();
+            try server.socket.setReceiveBufferSize(64 * 1024);
+            try server_port.send(server.socket.address.ip.getPort());
+            var stream = try server.accept(.{});
+            defer stream.close();
+
+            var buf: [4096]u8 = undefined;
+            var total_received = try stream.read(&buf, .none);
+            try events.send(total_received);
+
+            try drain.receive();
+            while (true) {
+                const n = try stream.read(&buf, .none);
+                if (n == 0) break;
+                total_received += n;
+            }
+            try events.send(total_received);
+        }
+    };
+
+    const Sender = struct {
+        fn run(client_io: Io, server_port: *Channel(u16), out: *Outcome) !void {
+            defer out.completed = true;
+            const port = try server_port.receive();
+            var f = try Io.Dir.cwd().openFile(client_io, path, .{});
+            defer f.close(client_io);
+            var fr_buf: [4096]u8 = undefined;
+            var fr = f.reader(client_io, &fr_buf);
+
+            const addr = try IpAddress.parseIp4("127.0.0.1", port);
+            var stream = try tcpConnectToAddress(addr, .{});
+            defer stream.close();
+            try stream.socket.setSendBufferSize(64 * 1024);
+
+            var wbuf: [4096]u8 = undefined;
+            var writer = stream.writer(&wbuf);
+            // A single call, so its result is the op's own result.
+            out.send_result = writer.interface.sendFile(&fr, .unlimited);
+            out.pos = fr.pos;
+            runtime_mod.sleep(.fromMilliseconds(60_000)) catch |err| {
+                out.after = err;
+            };
+        }
+    };
+
+    var server_port_buf: [1]u16 = undefined;
+    var server_port_ch = Channel(u16).init(&server_port_buf);
+    var events_buf: [2]anyerror!usize = undefined;
+    var events_ch = Channel(anyerror!usize).init(&events_buf);
+    var drain_buf: [1]void = undefined;
+    var drain_ch = Channel(void).init(&drain_buf);
+
+    var outcome: Outcome = .{};
+    var server = try runtime.spawn(ServerTask.run, .{ &server_port_ch, &events_ch, &drain_ch });
+    defer server.cancel();
+    var sender = try runtime.spawn(Sender.run, .{ io, &server_port_ch, &outcome });
+    defer sender.cancel();
+
+    // Once the first bytes arrived, give the sender time to fill the socket
+    // buffers and block in the send, then cancel it.
+    _ = try (try events_ch.receive());
+    try runtime_mod.sleep(.fromMilliseconds(50));
+    sender.cancel();
+
+    // The bytes that went out are reported and the reader is advanced past
+    // them; the cancellation shows up at the next cancellation point instead.
+    try std.testing.expect(outcome.completed);
+    const sent = try outcome.send_result;
+    try std.testing.expect(sent < total);
+    try std.testing.expectEqual(sent, outcome.pos);
+    try std.testing.expectEqual(error.Canceled, outcome.after.?);
+
+    // The sender closed its end, so the server reads exactly what was sent.
+    // Windows resets the connection when a TransmitFile is aborted, so the
+    // peer can't read the rest there.
+    if (builtin.os.tag == .windows) return;
+    try drain_ch.send({});
+    try std.testing.expectEqual(sent, try (try events_ch.receive()));
 }
 
 test "IpAddress: initIp4" {

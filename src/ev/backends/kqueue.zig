@@ -178,6 +178,14 @@ pub const NetSendFileData = struct {
     sent: usize = 0,
 };
 
+/// Ends a native sendfile op with `err`, or with the bytes sent so far if
+/// there were any (see NetSendFile).
+fn finishNetSendFile(comp: *Completion, err: anyerror) CheckResult {
+    const sent = comp.cast(NetSendFile).internal.sent;
+    if (sent > 0) comp.setResult(.net_send_file, sent) else comp.setError(err);
+    return .completed;
+}
+
 const log = @import("../../common.zig").log;
 
 // These are not defined in std.c for FreeBSD/NetBSD,
@@ -725,6 +733,18 @@ pub fn cancel(self: *Self, state: *LoopState, target: *Completion) void {
         // completion once the owner marks it completed. The kqueue registration is
         // persistent and left in place for the fd's lifetime.
         if (!sockreg.detach(self, target)) return;
+        // A sendfile parked partway through reports what it sent (see
+        // NetSendFile).
+        if (comptime capability(.net_send_file) == .yes) {
+            if (target.op == .net_send_file) {
+                const sent = target.cast(NetSendFile).internal.sent;
+                if (sent > 0) {
+                    target.setResult(.net_send_file, sent);
+                    state.markCompletedFromBackend(target);
+                    return;
+                }
+            }
+        }
     } else {
         self.removeFromPollQueue(target);
     }
@@ -1039,8 +1059,7 @@ pub fn checkCompletion(comp: *Completion, event: *const std.c.Kevent) CheckResul
             if (comptime capability(.net_send_file) != .yes) unreachable;
             const data = comp.cast(NetSendFile);
             if (handleKqueueError(event, net.errnoToSendError)) |err| {
-                comp.setError(err);
-                return .completed;
+                return finishNetSendFile(comp, err);
             }
             while (data.internal.remaining > 0) {
                 var sbytes: posix.off_t = 0;
@@ -1068,14 +1087,8 @@ pub fn checkCompletion(comp: *Completion, event: *const std.c.Kevent) CheckResul
                     .AGAIN => return .requeue,
                     // The source is not a regular file (e.g. a pipe), which
                     // the caller can recover from by reading it instead.
-                    .INVAL => {
-                        comp.setError(error.Unseekable);
-                        return .completed;
-                    },
-                    else => |err| {
-                        comp.setError(net.errnoToSendError(err));
-                        return .completed;
-                    },
+                    .INVAL => return finishNetSendFile(comp, error.Unseekable),
+                    else => |err| return finishNetSendFile(comp, net.errnoToSendError(err)),
                 }
             }
             comp.setResult(.net_send_file, data.internal.sent);

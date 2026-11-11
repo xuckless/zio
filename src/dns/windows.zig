@@ -25,7 +25,7 @@ const LookupContext = struct {
 fn completionCallback(dwError: u32, _: u32, lpOverlapped: ?*windows.OVERLAPPED) callconv(.winapi) void {
     const ctx: *LookupContext = @fieldParentPtr("overlapped", lpOverlapped.?);
     ctx.err = dwError;
-    ctx.waiter.signal();
+    ctx.waiter.signalExternal();
 }
 
 pub fn lookup(
@@ -63,6 +63,7 @@ pub fn lookup(
         .waiter = .init(),
         .err = 0,
     };
+    defer ctx.waiter.deinit();
     var cancel_handle: windows.HANDLE = undefined;
 
     const rc = windows.GetAddrInfoExW(
