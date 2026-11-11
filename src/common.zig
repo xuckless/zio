@@ -942,6 +942,19 @@ pub fn timedWaitForIoClock(c: *ev.Completion, timeout: Timeout, clock: Clock) (T
     }
 }
 
+/// Like `timedWaitForIoClock`, but without a timeout an operation that
+/// finishes inside `loop.add` returns at once (`waitForIoPreferInline`). For
+/// datagram batches: a reader whose socket keeps a full batch queued then
+/// takes several batches per executor pass, bounded by the tick budget
+/// (`yieldPointNoPark`), instead of parking once per batch and costing the
+/// executor a pass and a backend poll each time. With a timeout the
+/// operation races a timer in a group, and that still goes through the
+/// dispatched queue.
+pub fn timedWaitForIoClockPreferInline(c: *ev.Completion, timeout: Timeout, clock: Clock) (Timeoutable || Cancelable)!void {
+    if (timeout == .none) return waitForIoPreferInline(c);
+    return timedWaitForIoClock(c, timeout, clock);
+}
+
 test "waitForIo: basic timer completion" {
     var rt = try Runtime.init(std.testing.allocator, .{});
     defer rt.deinit();

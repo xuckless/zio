@@ -2670,7 +2670,7 @@ noinline fn netSendOpImpl(
         }
 
         var op = ev.NetSendMmsg.init(stdIoHandleToZio(handle), slots[0..batch.len], zio_flags);
-        timedWaitForIoClock(&op.c, deadline, clock) catch |err| {
+        common.timedWaitForIoClockPreferInline(&op.c, deadline, clock) catch |err| {
             // A failed wait means this batch sent nothing, but the earlier
             // ones can't be taken back, so the caller gets their count, and a
             // cancellation is left for its next cancellation point.
@@ -2802,7 +2802,7 @@ noinline fn netReceiveMmsg(
         slots[0..n],
         zio_flags,
     );
-    try timedWaitForIoClock(&op.c, timeout, clock);
+    try common.timedWaitForIoClockPreferInline(&op.c, timeout, clock);
     const count = op.getResult() catch |err| {
         return .{ recvMsgErrToReceiveErr(err), 0 };
     };
@@ -5930,67 +5930,87 @@ test "io: sendManyTimeout and receiveManyTimeout carry several datagrams with co
     }
 }
 
-test "io: datagram batches received back to back still let another task run" {
-    // On io_uring a batch after a full one is received inside `loop.add`,
-    // without the ring; it still resumes through the dispatched queue, behind
-    // the tasks already ready, as on epoll.
+test "io: datagram batches received back to back still yield at the tick budget" {
+    // A batch receive or send that finishes inside `loop.add` returns without
+    // parking: on io_uring a receive after a full batch (and a send with
+    // fast_send), on epoll any batch the socket already holds. Each spends a
+    // quantum of the tick budget, so a reader whose socket never runs dry
+    // still lets another task run. The socket echoes every batch to itself,
+    // so a full batch is always queued; more rounds than one tick's budget
+    // plus the grace. An accept waits in the backend all along, as in a
+    // server, so the executor's polls are not skipped for lack of I/O.
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     const rt = try Runtime.init(std.testing.allocator, .{ .executors = .exact(1) });
     defer rt.deinit();
 
     const Event = @import("sync/Event.zig");
-    const batch = 32;
-    const n_batches = 6;
+    const Executor = runtime_mod.Executor;
+    const batch = 8;
+    const n_rounds = Executor.max_tick_budget + Executor.no_park_grace + 1;
 
     const Worker = struct {
         event: Event = .init,
-        batches: usize = 0,
-        /// `batches` when the other task ran.
+        rounds: usize = 0,
+        /// `rounds` when the other task ran.
         seen: ?usize = null,
 
         fn other(w: *@This()) !void {
             try w.event.wait();
-            w.seen = w.batches;
+            w.seen = w.rounds;
         }
 
-        fn receiveBatch(io: Io, receiver: Io.net.Socket) !void {
+        fn acceptOne(io: Io, server: *Io.net.Server) !void {
+            const stream = try server.accept(io);
+            stream.close(io);
+        }
+
+        /// Receives a full batch and sends it back to the same socket.
+        fn echoRound(io: Io, socket: Io.net.Socket) !void {
             var messages: [batch]Io.net.IncomingMessage = @splat(.init);
             var buf: [batch * 64]u8 = undefined;
-            const err, const n = receiver.receiveManyTimeout(io, &messages, &buf, .{}, .none);
+            const err, const n = socket.receiveManyTimeout(io, &messages, &buf, .{}, .none);
             try std.testing.expectEqual(null, err);
             try std.testing.expectEqual(batch, n);
+            try sendBatch(io, socket);
+        }
+
+        fn sendBatch(io: Io, socket: Io.net.Socket) !void {
+            var out: [batch]Io.net.OutgoingMessage = undefined;
+            for (&out) |*m| m.* = .{ .address = &socket.address, .data_ptr = "x", .data_len = 1 };
+            const err, const sent = socket.sendManyTimeout(io, &out, .{}, .none);
+            try std.testing.expectEqual(null, err);
+            try std.testing.expectEqual(batch, sent);
         }
 
         fn run(w: *@This(), io: Io) !void {
-            var sender = try Io.net.IpAddress.bind(&.{ .ip4 = .loopback(0) }, io, .{ .mode = .dgram });
-            defer sender.close(io);
-            var receiver = try Io.net.IpAddress.bind(&.{ .ip4 = .loopback(0) }, io, .{ .mode = .dgram });
-            defer receiver.close(io);
-            const rcvbuf: c_int = 1 << 20;
-            try os_net.setsockopt(stdIoHandleToZio(receiver.handle), os_net.SOL.SOCKET, os_net.SO.RCVBUF, std.mem.asBytes(&rcvbuf));
+            var socket = try Io.net.IpAddress.bind(&.{ .ip4 = .loopback(0) }, io, .{ .mode = .dgram });
+            defer socket.close(io);
+            var server = try Io.net.IpAddress.listen(&.{ .ip4 = .loopback(0) }, io, .{ .reuse_address = true });
+            defer server.deinit(io);
 
-            var out: [batch]Io.net.OutgoingMessage = undefined;
-            for (&out) |*m| m.* = .{ .address = &receiver.address, .data_ptr = "x", .data_len = 1 };
-            for (0..n_batches) |_| {
-                const send_err, const sent = sender.sendManyTimeout(io, &out, .{}, .none);
-                try std.testing.expectEqual(null, send_err);
-                try std.testing.expectEqual(batch, sent);
-            }
+            // Two batches queued: each round takes one and puts one back.
+            try sendBatch(io, socket);
+            try sendBatch(io, socket);
 
+            var acceptor = try io.concurrent(acceptOne, .{ io, &server });
+            defer acceptor.cancel(io) catch {};
             var future = try io.concurrent(other, .{w});
             defer future.cancel(io) catch {};
-            // Let it run up to its wait.
+            // Let both run up to their waits.
             try runtime_mod.yield();
 
-            // The first batch fills every slot, so on io_uring the rest skip
-            // the ring.
-            try receiveBatch(io, receiver);
-            w.batches = 1;
+            // The first batch fills every slot, so on io_uring the next
+            // ones skip the ring.
+            try echoRound(io, socket);
+            w.rounds = 1;
             w.event.set();
-            while (w.batches < n_batches) : (w.batches += 1) try receiveBatch(io, receiver);
+            while (w.rounds < n_rounds) : (w.rounds += 1) try echoRound(io, socket);
 
+            // Each round spends at least one quantum, so the reader yields
+            // within a tick's budget plus the grace, and the woken task,
+            // queued ahead of it, runs.
             const seen = w.seen orelse return error.TestUnexpectedResult;
-            try std.testing.expect(seen <= 2);
+            try std.testing.expect(seen <= Executor.max_tick_budget + Executor.no_park_grace);
             try future.await(io);
         }
     };
