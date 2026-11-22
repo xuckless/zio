@@ -55,9 +55,18 @@ const MemoryPool = @import("utils/memory_pool.zig").MemoryPool;
 const zio_options = @import("options.zig").options;
 
 /// Must match `net.Stream.max_iovecs_len` in std.Io. Used as the cap on
-/// scatter/gather vector counts for netRead/netWrite so we never promise
-/// the caller more than std.Io's reader/writer is prepared to handle.
+/// scatter/gather vector counts for reads (std.Io's reader never offers
+/// more), file writes and batch operations.
 const max_iovecs_len = 8;
+
+/// Cap on the gather list of one stream write that offers `max_iovecs_len`
+/// or more data slices. std's `net.Stream.Writer.drain` passes its whole
+/// slice list and takes a short count, so the write side isn't bound by
+/// std's 8; a vectored caller (an HTTP/2 flush round of 64 frames) then goes
+/// out in one or two sendmsg instead of one per 7 slices. nginx preallocates
+/// 64 iovecs per writev (`NGX_IOVS_PREALLOCATE`); IOV_MAX is 1024. Smaller
+/// writes keep the 8-wide frame (see `netWriteOp`).
+const max_write_iovecs = 64;
 
 pub const debug_io: Io = .{ .userdata = null, .vtable = &vtable };
 
@@ -538,7 +547,7 @@ fn operateInner(operation: Io.Operation, timeout: time.Timeout, clock: time.Cloc
             break :result .{ .data_len = n };
         } },
         .net_write => |*o| return .{ .net_write = result: {
-            const n = @call(.never_inline, netWriteOpImpl, .{ o.socket_handle, o.header, o.data, o.splat, timeout, clock }) catch |err| switch (err) {
+            const n = @call(.never_inline, netWriteOp, .{ o.socket_handle, o.header, o.data, o.splat, timeout, clock }) catch |err| switch (err) {
                 error.Canceled => |e| return e,
                 error.Timeout => |e| return e,
                 else => |e| break :result e,
@@ -2941,20 +2950,40 @@ fn sendErrToWriteErr(err: ev.NetSend.Error) Io.Operation.NetWrite.Error {
     };
 }
 
-fn netWriteOpImpl(
+const NetWriteOpError = Io.Operation.NetWrite.Error || Io.Cancelable || common.Timeoutable;
+
+/// Picks the gather-list width for one stream write: `max_write_iovecs` when
+/// the slices may not fit in `max_iovecs_len` (the header takes a slot), else
+/// the small frame. Each width is its own never-inlined instance, so only
+/// the one that runs holds its arrays on the task's stack.
+fn netWriteOp(
     handle: Io.net.Socket.Handle,
     header: []const u8,
     data: []const []const u8,
     splat: usize,
     timeout: time.Timeout,
     clock: time.Clock,
-) (Io.Operation.NetWrite.Error || Io.Cancelable || common.Timeoutable)!usize {
-    var slices: [max_iovecs_len][]const u8 = undefined;
+) NetWriteOpError!usize {
+    if (data.len >= max_iovecs_len)
+        return @call(.never_inline, netWriteOpImpl, .{ max_write_iovecs, handle, header, data, splat, timeout, clock });
+    return @call(.never_inline, netWriteOpImpl, .{ max_iovecs_len, handle, header, data, splat, timeout, clock });
+}
+
+fn netWriteOpImpl(
+    comptime cap: usize,
+    handle: Io.net.Socket.Handle,
+    header: []const u8,
+    data: []const []const u8,
+    splat: usize,
+    timeout: time.Timeout,
+    clock: time.Clock,
+) NetWriteOpError!usize {
+    var slices: [cap][]const u8 = undefined;
     var splat_buf: [64]u8 = undefined;
     const n = fillBuf(&slices, header, data, splat, &splat_buf);
     if (n == 0) return 0;
 
-    var iovecs: [max_iovecs_len]os_net.iovec_const = undefined;
+    var iovecs: [cap]os_net.iovec_const = undefined;
     const wbuf = ev.WriteBuf.fromSlices(slices[0..n], &iovecs);
 
     if (sendNow(handle, wbuf.iovecs)) |r| return r catch |err| return sendErrToWriteErr(err);
@@ -3018,7 +3047,7 @@ fn netWriteFileImpl(
     // back for the file body.
     const reader_buffered = limit.slice(file_reader.interface.buffered());
     if (header.len != 0 or reader_buffered.len != 0) {
-        const n = netWriteOpImpl(handle, header, &.{reader_buffered}, 1, .none, .awake) catch |err| switch (err) {
+        const n = netWriteOpImpl(max_iovecs_len, handle, header, &.{reader_buffered}, 1, .none, .awake) catch |err| switch (err) {
             error.Timeout => unreachable,
             else => |e| return e,
         };
@@ -6403,6 +6432,113 @@ test "io: batch awaitConcurrent with a net_write operation" {
 
             batch.cancel(io);
             try client.shutdown(io, .send);
+
+            future.await(io);
+            try sink_err;
+        }
+    };
+
+    var handle = try rt.spawn(Worker.run, .{rt.io()});
+    try handle.join();
+}
+
+/// `count` 4-byte slices of distinct bytes for the gather-write tests, after
+/// a 2-byte header; `expected` is the stream the peer should read.
+fn TestGatherWrite(comptime count: usize) type {
+    return struct {
+        const header = "H:";
+        bytes: [count * 4]u8,
+        slices: [count][]const u8,
+        expected: [header.len + count * 4]u8,
+
+        fn init(self: *@This()) void {
+            for (&self.bytes, 0..) |*b, i| b.* = @truncate(i *% 7 +% i / 256);
+            for (&self.slices, 0..) |*slice, i| slice.* = self.bytes[i * 4 ..][0..4];
+            @memcpy(self.expected[0..header.len], header);
+            @memcpy(self.expected[header.len..], &self.bytes);
+        }
+
+        /// Reads `peer` to EOF and checks it carried `expected` in order.
+        fn sink(io: Io, peer: Io.net.Stream, expected: []const u8, out: *anyerror!void) void {
+            out.* = collect(io, peer, expected);
+        }
+
+        fn collect(io: Io, peer: Io.net.Stream, expected: []const u8) !void {
+            var recv_buf: [256]u8 = undefined;
+            var reader = peer.reader(io, &recv_buf);
+            const got = try reader.interface.allocRemaining(std.testing.allocator, .unlimited);
+            defer std.testing.allocator.free(got);
+            try std.testing.expectEqualSlices(u8, expected, got);
+        }
+    };
+}
+
+test "io: net_write takes more than max_iovecs_len slices in one operation" {
+    const rt = try Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+
+    const Gather = TestGatherWrite(40);
+    const Worker = struct {
+        fn run(io: Io) !void {
+            var pair: TestTcpPair = try .open(io);
+            defer pair.close(io);
+
+            var g: Gather = undefined;
+            g.init();
+            var sink_err: anyerror!void = {};
+            var future = io.async(Gather.sink, .{ io, pair.peer, &g.expected, &sink_err });
+            defer future.cancel(io);
+
+            // 41 iovecs, well under max_write_iovecs and a few hundred bytes
+            // the socket takes at once: one operation sends it all.
+            const result = try io.operate(.{ .net_write = .{
+                .socket_handle = pair.client.socket.handle,
+                .header = Gather.header,
+                .data = &g.slices,
+            } });
+            try std.testing.expectEqual(g.expected.len, try result.net_write);
+            try pair.client.shutdown(io, .send);
+
+            future.await(io);
+            try sink_err;
+        }
+    };
+
+    var handle = try rt.spawn(Worker.run, .{rt.io()});
+    try handle.join();
+}
+
+test "io: net_write past max_write_iovecs returns a short count the writer finishes" {
+    const rt = try Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+
+    const Gather = TestGatherWrite(200);
+    const Worker = struct {
+        fn run(io: Io) !void {
+            var pair: TestTcpPair = try .open(io);
+            defer pair.close(io);
+
+            var g: Gather = undefined;
+            g.init();
+            var sink_err: anyerror!void = {};
+            var future = io.async(Gather.sink, .{ io, pair.peer, &g.expected, &sink_err });
+            defer future.cancel(io);
+
+            // The header takes one of the max_write_iovecs slots.
+            const result = try io.operate(.{ .net_write = .{
+                .socket_handle = pair.client.socket.handle,
+                .header = Gather.header,
+                .data = &g.slices,
+            } });
+            const first = try result.net_write;
+            try std.testing.expectEqual(Gather.header.len + (max_write_iovecs - 1) * 4, first);
+
+            // The rest through std's Stream.Writer, which loops on short counts.
+            var send_buf: [16]u8 = undefined;
+            var writer = pair.client.writer(io, &send_buf);
+            try writer.interface.writeVecAll(g.slices[(first - Gather.header.len) / 4 ..]);
+            try writer.interface.flush();
+            try pair.client.shutdown(io, .send);
 
             future.await(io);
             try sink_err;
