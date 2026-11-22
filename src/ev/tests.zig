@@ -91,7 +91,7 @@ test "Loop: idle_ns counts a poll that waited, not a zero-timeout poll" {
 
     // Force epoll under auto mode: the group's first loop picks the engine.
     var group: @import("loop.zig").LoopGroup = .{};
-    if (backend == .linux) group.shared.selection = .epoll;
+    if (backend == .linux) group.shared.selection = .{ .epoll = null };
 
     var loop: Loop = undefined;
     try loop.init(.{ .loop_group = &group });

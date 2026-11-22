@@ -29,10 +29,22 @@ pub fn Backend(comptime mode: Mode) type {
             epoll,
         };
 
-        const Selection = enum {
+        /// Why `.auto` mode ended up on epoll: the io_uring setup error that
+        /// is treated as "this kernel or sandbox has no usable ring".
+        pub const FallbackReason = enum {
+            /// ENOSYS: no io_uring in the kernel, or a filter answering so.
+            system_outdated,
+            /// EPERM: kernel.io_uring_disabled, a seccomp filter or an LSM.
+            permission_denied,
+            /// EINVAL: the kernel does not know a setup flag (DEFER_TASKRUN needs 6.1).
+            arguments_invalid,
+        };
+
+        const Selection = union(enum) {
             undecided,
             io_uring,
-            epoll,
+            /// null: epoll was asked for, not fallen back to.
+            epoll: ?FallbackReason,
         };
 
         pub const NetHandle = IoUring.NetHandle;
@@ -101,10 +113,21 @@ pub fn Backend(comptime mode: Mode) type {
             return .maybe;
         }
 
-        fn ringUnavailable(err: anyerror) bool {
-            return err == error.SystemOutdated or
-                err == error.PermissionDenied or
-                err == error.ArgumentsInvalid;
+        fn fallbackReason(err: anyerror) ?FallbackReason {
+            if (err == error.SystemOutdated) return .system_outdated;
+            if (err == error.PermissionDenied) return .permission_denied;
+            if (err == error.ArgumentsInvalid) return .arguments_invalid;
+            return null;
+        }
+
+        /// The io_uring setup error behind a fallback to epoll, null when
+        /// io_uring is in use or epoll was requested. Final once the first
+        /// loop of the group has initialized.
+        pub fn ioUringFallback(shared_state: *const SharedState) ?FallbackReason {
+            return switch (shared_state.selection) {
+                .epoll => |why| why,
+                .undecided, .io_uring => null,
+            };
         }
 
         fn initIoUring(
@@ -116,7 +139,6 @@ pub fn Backend(comptime mode: Mode) type {
             var engine: IoUring = undefined;
             try engine.init(allocator, queue_size, &shared_state.io_uring);
             self.* = .{ .engine = .{ .io_uring = engine } };
-            shared_state.selection = .io_uring;
         }
 
         fn initEpoll(
@@ -128,7 +150,6 @@ pub fn Backend(comptime mode: Mode) type {
             var engine: Epoll = undefined;
             try engine.init(allocator, queue_size, &shared_state.epoll);
             self.* = .{ .engine = .{ .epoll = engine } };
-            shared_state.selection = .epoll;
         }
 
         pub fn init(
@@ -153,13 +174,22 @@ pub fn Backend(comptime mode: Mode) type {
                     return self.initEpoll(allocator, queue_size, shared_state);
                 },
                 .undecided => switch (mode) {
-                    .io_uring => return self.initIoUring(allocator, queue_size, shared_state),
-                    .epoll => return self.initEpoll(allocator, queue_size, shared_state),
+                    .io_uring => {
+                        try self.initIoUring(allocator, queue_size, shared_state);
+                        shared_state.selection = .io_uring;
+                    },
+                    .epoll => {
+                        try self.initEpoll(allocator, queue_size, shared_state);
+                        shared_state.selection = .{ .epoll = null };
+                    },
                     .auto => {
                         self.initIoUring(allocator, queue_size, shared_state) catch |err| {
-                            if (!ringUnavailable(err)) return err;
-                            return self.initEpoll(allocator, queue_size, shared_state);
+                            const why = fallbackReason(err) orelse return err;
+                            try self.initEpoll(allocator, queue_size, shared_state);
+                            shared_state.selection = .{ .epoll = why };
+                            return;
                         };
+                        shared_state.selection = .io_uring;
                     },
                 },
             }
@@ -281,4 +311,24 @@ pub fn Backend(comptime mode: Mode) type {
             };
         }
     };
+}
+
+test "fallbackReason maps the three setup errors a missing ring produces" {
+    const B = Backend(.auto);
+    try std.testing.expectEqual(B.FallbackReason.system_outdated, B.fallbackReason(error.SystemOutdated).?);
+    try std.testing.expectEqual(B.FallbackReason.permission_denied, B.fallbackReason(error.PermissionDenied).?);
+    try std.testing.expectEqual(B.FallbackReason.arguments_invalid, B.fallbackReason(error.ArgumentsInvalid).?);
+    try std.testing.expectEqual(@as(?B.FallbackReason, null), B.fallbackReason(error.OutOfMemory));
+}
+
+test "ioUringFallback reports the recorded reason only for a fallback" {
+    const B = Backend(.auto);
+    var shared: B.SharedState = .{};
+    try std.testing.expectEqual(@as(?B.FallbackReason, null), B.ioUringFallback(&shared));
+    shared.selection = .io_uring;
+    try std.testing.expectEqual(@as(?B.FallbackReason, null), B.ioUringFallback(&shared));
+    shared.selection = .{ .epoll = null };
+    try std.testing.expectEqual(@as(?B.FallbackReason, null), B.ioUringFallback(&shared));
+    shared.selection = .{ .epoll = .permission_denied };
+    try std.testing.expectEqual(B.FallbackReason.permission_denied, B.ioUringFallback(&shared).?);
 }

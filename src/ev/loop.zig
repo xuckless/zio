@@ -593,6 +593,13 @@ pub const Loop = struct {
         if (in_debug_mode) current_loop = self;
     }
 
+    /// Why the Linux backend fell back from io_uring to epoll (the setup error
+    /// of the first loop's ring), null when io_uring is in use or epoll was
+    /// requested. Linux backend only (not analyzed elsewhere unless called).
+    pub fn ioUringFallback(self: *const Loop) ?Backend.FallbackReason {
+        return Backend.ioUringFallback(&self.loop_group.shared);
+    }
+
     pub fn deinit(self: *Loop) void {
         self.assertOwnThread();
         if (in_debug_mode) current_loop = null;
